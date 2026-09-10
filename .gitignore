@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Task-local reports are not package sources.
+IMPLEMENTATION_REPORT.md
+REPORT_AUTH.md
+PROGRESS.md
+PROGRESS_AUTH.md
+artifacts/
