@@ -7,7 +7,7 @@ import pytest
 
 from codex_pool.accounts import AccountStore
 from codex_pool.chain import ChainStore
-from codex_pool.server import create_app, _extract_config
+from codex_pool.server import create_app, _extract_config, _with_encrypted_reasoning_include
 from fakes import ScriptedUpstream, write_auth_fixture
 
 API_KEY = "test-key-do-not-log"
@@ -575,3 +575,411 @@ async def test_slow_token_refresh_does_not_serialize_concurrent_requests(tmp_pat
 
     assert all(r.status_code == 200 for r in results)
     assert elapsed < 0.55
+
+
+# --- Native Codex cache-affinity identity parity -----------------------------
+
+
+def test_with_encrypted_reasoning_include_preserves_caller_order_and_dedups():
+    assert _with_encrypted_reasoning_include({"model": "m"})["include"] == ["reasoning.encrypted_content"]
+    assert _with_encrypted_reasoning_include({"include": ["foo"]})["include"] == ["foo", "reasoning.encrypted_content"]
+    preordered = {"include": ["foo", "reasoning.encrypted_content", "bar"]}
+    assert _with_encrypted_reasoning_include(preordered)["include"] == ["foo", "reasoning.encrypted_content", "bar"]
+    assert _with_encrypted_reasoning_include({"include": "reasoning.encrypted_content"})["include"] == [
+        "reasoning.encrypted_content"
+    ]
+
+
+def test_effective_include_default_is_visible_to_config_hash_extraction():
+    # The default must be applied before `_extract_config` so affinity/config
+    # hashing keys off the same `include` list actually forwarded upstream.
+    effective = _with_encrypted_reasoning_include({"model": "m", "input": []})
+    cfg = _extract_config(effective)
+    assert cfg["include"] == ["reasoning.encrypted_content"]
+
+
+@pytest.mark.asyncio
+async def test_encrypted_reasoning_include_default_forwarded_and_preserves_caller_include(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
+    )
+    app = create_app(accounts=accounts, chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        resp = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-5-codex",
+                "input": [{"role": "user", "content": "hello"}],
+                "include": ["file_search_call.results"],
+            },
+        )
+    assert resp.status_code == 200
+    assert upstream.calls[0]["payload"]["include"] == ["file_search_call.results", "reasoning.encrypted_content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_headers,body_extra,expect_from",
+    [
+        ({}, {}, "chain_id"),
+        ({"session_id": "hdr-session-1"}, {}, "session_header"),
+        ({"thread_id": "hdr-thread-1"}, {}, "thread_header"),
+        ({"session_id": "hdr-session-2", "thread_id": "hdr-thread-2"}, {}, "session_header"),
+        (
+            {"session_id": "hdr-session-3", "thread_id": "hdr-thread-3"},
+            {"prompt_cache_key": "explicit-key"},
+            "prompt_cache_key",
+        ),
+        # No anchor header: a body-only prompt_cache_key (e.g. a generic SDK's
+        # shared/model-global key) is NOT proof of per-caller identity and
+        # must not be promoted — the chain_id fallback governs instead.
+        ({}, {"prompt_cache_key": "shared-model-wide-key"}, "chain_id"),
+    ],
+    ids=[
+        "headerless_chain_id",
+        "session_header_only",
+        "thread_header_only",
+        "session_wins_over_thread",
+        "cache_key_wins_over_both_with_anchor",
+        "cache_key_only_no_anchor_falls_back_to_chain_id",
+    ],
+)
+async def test_conversation_identity_precedence_table(tmp_path, extra_headers, body_extra, expect_from):
+    """Native anchor rule: an explicit session_id/thread_id header must be
+    present before prompt_cache_key/session_id/thread_id can be promoted to
+    the upstream identity; otherwise the proxy's own stable per-chain id
+    governs all three upstream fields (including replacing a body-only
+    cache key)."""
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
+    )
+    app = create_app(accounts=accounts, chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+
+    body = {"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}], **body_extra}
+    async with _client(app) as client:
+        resp = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}", **extra_headers},
+            json=body,
+        )
+    assert resp.status_code == 200
+    call = upstream.calls[0]
+    identity = call["session_id"]
+    # Native semantics: one stable identity, byte-identical across the header
+    # pair and the body cache key.
+    assert call["thread_id"] == identity
+    assert call["payload"]["prompt_cache_key"] == identity
+
+    caller_supplied_values = {"hdr-session-1", "hdr-thread-1", "hdr-session-2", "hdr-thread-2", "explicit-key", "shared-model-wide-key"}
+    if expect_from == "chain_id":
+        assert identity not in caller_supplied_values
+    elif expect_from == "session_header":
+        assert identity == extra_headers["session_id"]
+    elif expect_from == "thread_header":
+        assert identity == extra_headers["thread_id"]
+    elif expect_from == "prompt_cache_key":
+        assert identity == "explicit-key"
+
+
+@pytest.mark.asyncio
+async def test_key_only_unrelated_callers_sharing_one_cache_key_do_not_collapse(tmp_path):
+    """Two unrelated callers sending the SAME body prompt_cache_key with no
+    session_id/thread_id anchor header (an ordinary generic-SDK shape, e.g. a
+    shared/model-global key) must land on distinct upstream identities and
+    distinct affinity chains — the cache key alone is not per-caller proof."""
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a"}]}],
+    )
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "b"}]}],
+    )
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-5-codex",
+                "input": [{"role": "user", "content": "topic A, unrelated to B"}],
+                "prompt_cache_key": "shared-model-wide-key",
+            },
+        )
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-5-codex",
+                "input": [{"role": "user", "content": "topic B, unrelated to A"}],
+                "prompt_cache_key": "shared-model-wide-key",
+            },
+        )
+
+    assert upstream.calls[0]["session_id"] != upstream.calls[1]["session_id"]
+    assert upstream.calls[0]["payload"]["prompt_cache_key"] != "shared-model-wide-key"
+    assert upstream.calls[1]["payload"]["prompt_cache_key"] != "shared-model-wide-key"
+    assert chain_store.record_count() == 2
+
+
+@pytest.mark.asyncio
+async def test_key_only_continuation_still_reuses_chain_identity(tmp_path):
+    """A key-only caller (no anchor header) on a genuine content continuation
+    still gets a stable, reused upstream identity across turns — the
+    headerless chain_id fallback, not the caller's shared cache key."""
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    first_output = [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "first reply", "annotations": []}],
+    }]
+    second_output = [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "second reply", "annotations": []}],
+    }]
+    upstream.queue_success(model="gpt-5-codex", output=first_output)
+    upstream.queue_success(model="gpt-5-codex", output=second_output)
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-5-codex",
+                "input": [{"role": "user", "content": "hello"}],
+                "prompt_cache_key": "shared-model-wide-key",
+            },
+        )
+        second_input = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "first reply"},
+            {"role": "user", "content": "continue"},
+        ]
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-5-codex",
+                "input": second_input,
+                "prompt_cache_key": "shared-model-wide-key",
+            },
+        )
+
+    assert chain_store.record_count() == 1
+    assert upstream.calls[0]["session_id"] == upstream.calls[1]["session_id"]
+    assert upstream.calls[0]["payload"]["prompt_cache_key"] == upstream.calls[1]["payload"]["prompt_cache_key"]
+    assert upstream.calls[0]["payload"]["prompt_cache_key"] != "shared-model-wide-key"
+
+
+@pytest.mark.asyncio
+async def test_headerless_client_gets_stable_chain_identity_reused_on_continuation(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    first_output = [{
+        "type": "message",
+        "id": "msg_0",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "first reply", "annotations": []}],
+    }]
+    second_output = [{
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "second reply", "annotations": []}],
+    }]
+    upstream.queue_success(model="gpt-5-codex", output=first_output)
+    upstream.queue_success(model="gpt-5-codex", output=second_output)
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}]},
+        )
+        second_input = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "first reply"},
+            {"role": "user", "content": "continue"},
+        ]
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": second_input},
+        )
+
+    # Same conversation (prefix-continuation) -> the owner-generated window
+    # identity is reused, not a fresh random id per request.
+    assert upstream.calls[0]["session_id"] == upstream.calls[1]["session_id"]
+    assert upstream.calls[0]["payload"]["prompt_cache_key"] == upstream.calls[1]["payload"]["prompt_cache_key"]
+
+
+@pytest.mark.asyncio
+async def test_headerless_unrelated_conversations_get_distinct_chain_identity(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a"}]}],
+    )
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "b"}]}],
+    )
+    app = create_app(accounts=accounts, chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "topic A, unrelated to B"}]},
+        )
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "topic B, unrelated to A"}]},
+        )
+
+    # Distinct conversations must never collapse onto one shared/model-global
+    # cache identity.
+    assert upstream.calls[0]["session_id"] != upstream.calls[1]["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_scheduling_ignores_caller_session_headers_uses_content_only(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    first_output = [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "first reply", "annotations": []}],
+    }]
+    second_output = [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "second reply", "annotations": []}],
+    }]
+    upstream.queue_success(model="gpt-5-codex", output=first_output)
+    upstream.queue_success(model="gpt-5-codex", output=second_output)
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}", "session_id": "alpha"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}]},
+        )
+        second_input = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "first reply"},
+            {"role": "user", "content": "continue"},
+        ]
+        # A DIFFERENT caller-supplied session header on the content-prefix
+        # continuation must not break affinity: scheduling is content-only.
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}", "session_id": "beta"},
+            json={"model": "gpt-5-codex", "input": second_input},
+        )
+
+    assert chain_store.record_count() == 1
+    assert upstream.calls[0]["account_id"] == upstream.calls[1]["account_id"] == "acct-1"
+    # The upstream identity still follows the (changed) caller header, proving
+    # headers steer only upstream metadata, never routing.
+    assert upstream.calls[0]["session_id"] == "alpha"
+    assert upstream.calls[1]["session_id"] == "beta"
+
+
+@pytest.mark.asyncio
+async def test_distinct_content_sharing_a_caller_session_header_is_not_merged(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a"}]}],
+    )
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "b"}]}],
+    )
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}", "session_id": "shared"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "topic A, unrelated to B"}]},
+        )
+        await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}", "session_id": "shared"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "topic B, unrelated to A"}]},
+        )
+
+    # A caller reusing the same session header across unrelated content must
+    # not merge them into one affinity baseline: content, not the header, is
+    # scheduling authority.
+    assert chain_store.record_count() == 2
+
+
+@pytest.mark.asyncio
+async def test_caller_supplied_account_id_and_cookie_headers_are_not_forwarded(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
+    )
+    app = create_app(accounts=accounts, chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        resp = await client.post(
+            "/v1/responses",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "ChatGPT-Account-ID": "attacker-acct",
+                "Cookie": "session=evil",
+            },
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 200
+    # account_id passed to Upstream is only ever the server-owned token
+    # manager value, never anything read from the caller's own headers.
+    assert upstream.calls[0]["account_id"] == "acct-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_include", [False, 1, {}])
+async def test_invalid_include_type_is_rejected_before_upstream(tmp_path, invalid_include):
+    upstream = ScriptedUpstream()
+    app = create_app(accounts=_setup_one_account(tmp_path), chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+    async with _client(app) as client:
+        response = await client.post("/v1/responses", headers={"Authorization": f"Bearer {API_KEY}"}, json={"model": "m", "input": [], "include": invalid_include})
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert upstream.calls == []

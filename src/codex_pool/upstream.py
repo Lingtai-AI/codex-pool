@@ -10,11 +10,14 @@ from a request body or header.
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 import httpx
 
+from . import __version__
 from .errors import UpstreamTransportError
 from .sse import decode_sse_stream
 
@@ -22,12 +25,34 @@ from .sse import decode_sse_stream
 # src/lingtai/llm/_register.py CODEX_OFFICIAL_BASE_URL).
 CODEX_OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
+# Honest client identity for the Codex `/backend-api/codex/responses` path.
+# codex-pool never impersonates the official Codex CLI (`codex_cli_rs`) or an
+# embedding LingTai install; it identifies itself by its own package name and
+# version. See reference/lingtai-kernel adapter.py `_codex_identity_headers`
+# for the analogous (opt-in-only) impersonation switch this deliberately does
+# not carry over.
+_ORIGINATOR = "codex-pool"
+_USER_AGENT = f"codex-pool/{__version__}"
+_SANDBOX = "codex-pool"
+
 
 class Upstream(Protocol):
     async def stream(
-        self, *, access_token: str, account_id: str | None, payload: dict[str, Any]
+        self,
+        *,
+        access_token: str,
+        account_id: str | None,
+        payload: dict[str, Any],
+        session_id: str | None = None,
+        thread_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield already-decoded Responses-API SSE event dicts, in order."""
+        """Yield already-decoded Responses-API SSE event dicts, in order.
+
+        ``session_id`` / ``thread_id`` are an optional stable per-conversation
+        cache-affinity identity resolved by the server layer (see
+        ``server._resolve_conversation_identity``); this port only forwards
+        them as request metadata and never derives or invents them itself.
+        """
         ...
 
 
@@ -97,16 +122,48 @@ class CodexHTTPUpstream:
         self._transport = transport
 
     async def stream(
-        self, *, access_token: str, account_id: str | None, payload: dict[str, Any]
+        self,
+        *,
+        access_token: str,
+        account_id: str | None,
+        payload: dict[str, Any],
+        session_id: str | None = None,
+        thread_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # Native Codex REST wire (verified against captured real Codex/LingTai
+        # traffic): `Accept: application/json`, no `OpenAI-Beta` header at all
+        # (that beta value is a WebSocket-only artifact upstream, see
+        # reference/lingtai-kernel adapter.py `_CODEX_WS_BETA_HEADER`). The
+        # response is still SSE-framed because `stream: true` is a body field,
+        # not something negotiated by `Accept`; `decode_sse_stream` below
+        # parses purely from the response bytes.
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "OpenAI-Beta": "responses=experimental",
+            "Accept": "application/json",
+            "originator": _ORIGINATOR,
+            "User-Agent": _USER_AGENT,
         }
         if account_id:
             headers["ChatGPT-Account-ID"] = account_id
+        if session_id and thread_id:
+            # Preserve the observed native underscore spellings; do not
+            # normalize them to hyphens. Grouped parity tests do not isolate
+            # the causal contribution of this spelling from other metadata.
+            headers["session_id"] = session_id
+            headers["thread_id"] = thread_id
+            headers["x-client-request-id"] = str(uuid.uuid4())
+            headers["x-codex-window-id"] = f"{session_id}:0"
+            turn_metadata = {
+                "session_id": session_id,
+                "thread_id": thread_id,
+                "turn_id": str(uuid.uuid4()),
+                "sandbox": _SANDBOX,
+                "turn_started_at_unix_ms": int(time.time() * 1000),
+            }
+            headers["x-codex-turn-metadata"] = json.dumps(
+                turn_metadata, separators=(",", ":"), sort_keys=True
+            )
 
         body = dict(payload)
         body["stream"] = True

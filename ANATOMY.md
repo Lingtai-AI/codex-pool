@@ -68,13 +68,21 @@ error/redaction behavior, and the local CLI/TUI boundary).
   CR/LF-aware SSE parsing/encoding shared by server and HTTP upstream.
 - `src/codex_pool/upstream.py` — `Upstream` protocol and the one production
   `CodexHTTPUpstream` adapter. Its base URL is fixed by construction; tests
-  inject an `httpx` transport and do not contact the live endpoint.
+  inject an `httpx` transport and do not contact the live endpoint. Builds the
+  native-parity wire headers (honest `codex-pool` originator/User-Agent, no
+  beta header, `Accept: application/json`, and the `session_id`/`thread_id`/
+  turn-metadata headers for the identity `server.py` resolves) — it never
+  derives that identity itself.
 - `src/codex_pool/errors.py` — local typed errors mapped to OpenAI-shaped
   response bodies.
 - `src/codex_pool/server.py` — `create_app()`: Starlette app exposing
   `POST /v1/responses` and `GET /health`. Wires bearer auth, request
   normalization/validation, routing, upstream driving, streaming versus
-  aggregated response shaping, and commit-on-complete success.
+  aggregated response shaping, and commit-on-complete success. Also resolves
+  the native-parity `reasoning.encrypted_content` include default (applied
+  before config hashing) and the per-conversation cache-affinity identity
+  (`_resolve_conversation_identity`) forwarded to `upstream.py`. Identity is
+  routing-blind; effective include participates in config-based affinity.
 - `src/codex_pool/cli_client.py` — thin async subprocess wrapper for the
   frozen CLI JSON/JSONL contract. Owns child cleanup and never provider/auth
   logic.

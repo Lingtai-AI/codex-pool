@@ -12,8 +12,11 @@
    pool accounts.
 
 There is no caller/session identifier and no client-visible concept of which
-account served a request. Quota data that is unavailable or unknown never
-excludes an account; only an explicit exhausted observation does.
+account served a request: routing itself reads only request content
+(`input`/config-effective fields) and never any caller-supplied identity —
+see "Upstream cache-affinity identity" below for the narrow, routing-blind
+exception. Quota data that is unavailable or unknown never excludes an
+account; only an explicit exhausted observation does.
 
 ## One current record per chain
 
@@ -68,6 +71,45 @@ and does not send `background`. Truthy `store` or `background`, plus
 `previous_response_id` and `conversation`, are rejected clearly rather than
 silently discarded. Other request fields are forwarded unchanged; unsupported
 provider behavior remains an upstream error.
+
+The proxy always adds `reasoning.encrypted_content` to the effective `include`
+list (preserving supported caller-supplied `include` values and their order) before
+both config hashing and the upstream call, matching what a native Codex
+session requests on every turn. Config hashing and the forwarded body always
+see this same effective `include` list, so this default cannot desync
+affinity matching from what is actually sent. Unsupported non-null `include`
+types (other than string or array) are rejected rather than silently discarded.
+
+### Upstream cache-affinity identity
+
+Independent of scheduling, the proxy resolves one stable per-conversation
+identity per request and sends it upstream as the literal, underscored
+`session_id` and `thread_id` HTTP headers plus the body `prompt_cache_key`
+field (all three byte-identical), matching native Codex REST cache-affinity
+behavior.
+
+Precedence requires an explicit anchor: a body `prompt_cache_key` only wins,
+and identity is only promoted to the `session_id`/`thread_id` headers, when
+the caller *also* sends an explicit `session_id` or `thread_id` request
+header. An ordinary Responses body `prompt_cache_key` alone (for example a
+generic SDK's shared/model-global cache key) is not proof of per-caller
+identity and is never promoted on its own — doing so could collapse unrelated
+callers who happen to share one key onto the same upstream cache slot. Given
+an anchor header, precedence is: explicit body `prompt_cache_key` first, else
+`session_id`, else `thread_id`.
+
+Ordinary callers that send no anchor header get the proxy's own per-chain id
+instead — reused on prefix continuation, fresh on no-match — substituted for
+*all three* upstream identity fields, including replacing any caller-supplied
+body `prompt_cache_key`. This headerless substitution is an explicit
+owner-layer adaptation for ordinary SDK clients: native bare construction
+keeps a body-only key without identity headers. Here, no-match requests get
+distinct identities even when their body-only cache keys are equal; actual
+content-prefix continuations reuse the existing chain identity.
+
+This identity is read-only input to the upstream request; it is never used
+for and never overrides the two scheduling rules above, and no new required
+header is introduced (both headers remain optional).
 
 ## Eligibility and authentication
 

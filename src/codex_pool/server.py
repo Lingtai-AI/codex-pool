@@ -1,7 +1,7 @@
 """Local loopback Responses API server.
 
 Exposes ``POST /v1/responses`` for an ordinary OpenAI Responses SDK client
-(``client.responses.create(...)``). No caller session header, no pool
+(``client.responses.create(...)``). No required caller session header, no pool
 selection endpoint — a client only ever sees a normal Responses API. Routing
 (the two rules) and one-latest-baseline bookkeeping happen here, driven by
 observing request/response content itself.
@@ -60,6 +60,19 @@ _CONFIG_FIELDS = (
     "truncation",
 )
 
+# Native Codex REST parity: every real Codex turn asks for the raw encrypted
+# reasoning item so replay can stay prompt-cache-stable (see
+# reference/lingtai-kernel adapter.py, the `reasoning.encrypted_content`
+# `include` default applied unconditionally before the request is built).
+_REQUIRED_INCLUDE = "reasoning.encrypted_content"
+
+# Narrow allowlist of request headers this server reads for optional,
+# caller-supplied conversation identity. Wire spellings are literal
+# underscored `session_id` / `thread_id` to match the Codex backend (see
+# `upstream.CodexHTTPUpstream.stream`); nothing else is read from caller
+# headers, and neither of these headers is required.
+_IDENTITY_HEADERS = ("session_id", "thread_id")
+
 
 def _normalize_body(body: object) -> object:
     """Losslessly normalize ordinary SDK request shapes before validation.
@@ -84,12 +97,57 @@ def _validate_request(body: object) -> None:
         raise PoolRequestError("'model' is required and must be a non-empty string")
     if not isinstance(body.get("input"), list):
         raise PoolRequestError("'input' is required and must be a string or an array of items")
+    include = body.get("include")
+    if include is not None and not isinstance(include, (str, list)):
+        raise PoolRequestError("'include' must be a string, an array, or null")
     for field, reason in _REJECTED_ALWAYS.items():
         if field in body:
             raise PoolRequestError(f"'{field}' is not supported by codex-pool: {reason}")
     for field, reason in _REJECTED_UNLESS_FALSE.items():
         if field in body and body[field] is not False:
             raise PoolRequestError(f"'{field}' is not supported by codex-pool except as false: {reason}")
+
+
+def _with_encrypted_reasoning_include(body: dict) -> dict:
+    """Apply the native ``reasoning.encrypted_content`` include default.
+
+    Preserves any caller-supplied ``include`` values and their order; only
+    appends the encrypted-content entry when the caller did not already ask
+    for it. Must run before ``_extract_config`` so affinity/config hashing
+    keys off the same effective ``include`` list this server forwards
+    upstream, rather than the raw caller value.
+    """
+    existing = body.get("include")
+    if isinstance(existing, str):
+        existing = [existing]
+    elif isinstance(existing, list):
+        existing = list(existing)
+    else:
+        existing = []
+    if _REQUIRED_INCLUDE not in existing:
+        existing = [*existing, _REQUIRED_INCLUDE]
+    return {**body, "include": existing}
+
+
+def _resolve_conversation_identity(*, body: dict, headers, fallback: str) -> str:
+    """Use native key > session > thread precedence only with a header anchor.
+
+    A body-only cache key may be model-global. Headerless SDK clients instead
+    use the existing content-affinity chain id for all three upstream fields;
+    a matching continuation reuses it, and a no-match receives a fresh id.
+    This proxy-owned fallback differs from native bare construction, which
+    keeps a body-only key without headers. Neither identity selects accounts.
+    """
+    has_anchor = any(headers.get(header_name) for header_name in _IDENTITY_HEADERS)
+    if has_anchor:
+        cache_key = body.get("prompt_cache_key")
+        if isinstance(cache_key, str) and cache_key:
+            return cache_key
+        for header_name in _IDENTITY_HEADERS:
+            value = headers.get(header_name)
+            if value:
+                return value
+    return fallback
 
 
 def _extract_config(body: dict) -> dict:
@@ -170,12 +228,24 @@ def _terminal_event(event: dict, outcome: _RunOutcome) -> dict:
 
 
 async def _drive_upstream(
-    upstream: Upstream, *, access_token: str, account_id: str | None, payload: dict
+    upstream: Upstream,
+    *,
+    access_token: str,
+    account_id: str | None,
+    payload: dict,
+    session_id: str | None = None,
+    thread_id: str | None = None,
 ) -> AsyncIterator[tuple[dict, _RunOutcome]]:
     """Yield ``(event, outcome)`` pairs and accumulate terminal output state."""
     outcome = _RunOutcome()
     try:
-        async for event in upstream.stream(access_token=access_token, account_id=account_id, payload=payload):
+        async for event in upstream.stream(
+            access_token=access_token,
+            account_id=account_id,
+            payload=payload,
+            session_id=session_id,
+            thread_id=thread_id,
+        ):
             if not isinstance(event, dict):
                 raise UpstreamTransportError("upstream returned malformed event data")
             etype = event.get("type")
@@ -245,6 +315,7 @@ def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Ups
 
         # Validation established the dict/list shapes above.
         assert isinstance(body, dict)
+        body = _with_encrypted_reasoning_include(body)
         cfg = _extract_config(body)
         input_items = body["input"]
         pool_accounts = accounts.list()
@@ -282,6 +353,15 @@ def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Ups
             account_id = None
 
         payload = _forward_payload(body)
+        # Native Codex parity: one stable per-conversation identity, sent
+        # byte-identically as body `prompt_cache_key` and the `session_id` /
+        # `thread_id` upstream headers. Resolved AFTER routing so the
+        # headerless fallback can reuse `decision.chain_id` (never before
+        # `select_account`, and never itself an input to that selection).
+        identity = _resolve_conversation_identity(
+            body=body, headers=request.headers, fallback=decision.chain_id
+        )
+        payload["prompt_cache_key"] = identity
         want_stream = bool(body.get("stream", False))
 
         def commit_on_success(outcome: _RunOutcome) -> None:
@@ -309,6 +389,8 @@ def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Ups
                 access_token=access_token,
                 account_id=account_id,
                 payload=payload,
+                session_id=identity,
+                thread_id=identity,
             )
             try:
                 first_event, first_outcome = await driver.__anext__()
@@ -343,6 +425,8 @@ def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Ups
             access_token=access_token,
             account_id=account_id,
             payload=payload,
+            session_id=identity,
+            thread_id=identity,
         ):
             pass
 
