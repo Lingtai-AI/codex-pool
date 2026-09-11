@@ -102,7 +102,15 @@ def test_quota_json_reports_per_account(capsys, monkeypatch, tmp_path):
     from codex_pool.quota import QuotaResult
 
     def fake_read_quota(auth_path, **kwargs):
-        return QuotaResult(42.0, None, None, None, "2026-01-01T00:00:00+00:00")
+        return QuotaResult(
+            42.0,
+            None,
+            "2026-01-01T01:00:00+00:00",
+            None,
+            "2026-01-01T00:00:00+00:00",
+            primary_window_name="burst",
+            primary_window_duration_mins=60.0,
+        )
 
     monkeypatch.setattr("codex_pool.quota.read_quota", fake_read_quota)
 
@@ -115,12 +123,40 @@ def test_quota_json_reports_per_account(capsys, monkeypatch, tmp_path):
             "quota": {
                 "primary_used_percent": 42.0,
                 "secondary_used_percent": None,
-                "primary_reset_at": None,
+                "primary_reset_at": "2026-01-01T01:00:00+00:00",
                 "secondary_reset_at": None,
                 "observed_at": "2026-01-01T00:00:00+00:00",
+                "status": "ok",
+                "primary_remaining_percent": 58.0,
+                "secondary_remaining_percent": None,
+                "primary_window_name": "burst",
+                "secondary_window_name": None,
+                "primary_window_duration_mins": 60.0,
+                "secondary_window_duration_mins": None,
             },
         }
     ]
+
+
+def test_quota_human_output_leads_with_remaining(capsys, monkeypatch, tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    AccountStore().import_account("work", str(auth))
+
+    from codex_pool.quota import QuotaResult
+
+    monkeypatch.setattr(
+        "codex_pool.quota.read_quota",
+        lambda auth_path, **kwargs: QuotaResult(
+            25.0, None, None, None, "2026-01-01T00:00:00+00:00"
+        ),
+    )
+
+    assert cli.main(["quota"]) == 0
+    output = capsys.readouterr().out
+    assert "primary_remaining=75.0%" in output
+    assert "primary_used=25.0%" in output
+    assert "status=ok" in output
 
 
 def test_quota_json_persists_known_exhaustion_for_routing(capsys, monkeypatch, tmp_path):

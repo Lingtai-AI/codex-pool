@@ -40,6 +40,9 @@ class FakeCLIClient:
         self._quota = quota or {"accounts": []}
         self.calls: list[tuple[str, tuple, dict]] = []
         self.status_error: CLIError | None = None
+        self.quota_error: CLIError | None = None
+        self.quota_gate: asyncio.Event | None = None
+        self.quota_started = asyncio.Event()
         self._login_events: dict[str, list[dict]] = {}
         self.login_block = False
         self.last_login_stream: _FakeLoginStream | None = None
@@ -55,6 +58,11 @@ class FakeCLIClient:
 
     async def quota(self) -> dict:
         self.calls.append(("quota", (), {}))
+        self.quota_started.set()
+        if self.quota_gate is not None:
+            await self.quota_gate.wait()
+        if self.quota_error is not None:
+            raise self.quota_error
         return self._quota
 
     async def accounts_import(self, ref: str, path: str, *, weight: int = 1) -> dict:
@@ -182,18 +190,112 @@ async def test_import_modal_cancel_does_not_call_import():
         assert not any(name == "accounts_import" for name, _, _ in client.calls)
 
 
-async def test_quota_refresh_displays_returned_facts():
+async def test_quota_meter_selection_failure_and_metadata_preservation():
     client = FakeCLIClient(
-        quota={"accounts": [{"ref": "a", "quota": {"primary_used_percent": 30, "secondary_used_percent": 10}}]}
+        status={
+            "accounts": [
+                _account("synthetic-a"),
+                _account("synthetic-b", weight=2),
+            ],
+            "eligible_count": 2,
+        },
+        quota={
+            "accounts": [
+                {
+                    "ref": "synthetic-a",
+                    "quota": {
+                        "status": "ok",
+                        "primary_used_percent": 30,
+                        "secondary_used_percent": 10,
+                        "primary_window_name": "reported burst",
+                        "primary_window_duration_mins": 300,
+                        "primary_reset_at": "2099-09-11T09:00:00+00:00",
+                        "secondary_reset_at": None,
+                        "observed_at": "2026-09-11T07:21:07+00:00",
+                    },
+                },
+                {
+                    "ref": "synthetic-b",
+                    "quota": {
+                        "status": "ok",
+                        "primary_used_percent": 100,
+                        "secondary_used_percent": None,
+                        "primary_window_duration_mins": 60,
+                        "primary_reset_at": "2099-09-11T10:00:00+00:00",
+                        "observed_at": "2026-09-11T07:22:07+00:00",
+                    },
+                },
+            ]
+        },
     )
     app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
+    async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         await pilot.press("u")
         await pilot.pause()
-        status = app.query_one("#status-line", Static)
-        assert "primary=30%" in str(status.content)
-        assert "secondary=10%" in str(status.content)
+        table = app.query_one(DataTable)
+        assert "70%" in str(table.get_cell("synthetic-a", "primary"))
+        assert "90%" in str(table.get_cell("synthetic-a", "secondary"))
+        assert "0%" in str(table.get_cell("synthetic-b", "primary"))
+        assert "N/A" in str(table.get_cell("synthetic-b", "secondary"))
+
+        table.move_cursor(row=1)
+        await pilot.pause()
+        detail = app.query_one("#selected-detail", Static)
+        assert "SELECTED synthetic-b" in str(detail.content)
+        assert "0% remaining" in str(detail.content)
+        assert "Duration 1h" in str(detail.content)
+        assert "Reset 2099-09-11 10:00Z" in str(detail.content)
+        assert "Observed 2026-09-11 07:22:07Z" in str(detail.content)
+        assert "Last attempt N/A" not in str(detail.content)
+
+        # A metadata-only refresh may reorder accounts and return quota=None,
+        # but selection and the last quota observation remain keyed by ref.
+        client._status = {
+            "accounts": [
+                {**_account("synthetic-b", weight=3), "quota": None},
+                {**_account("synthetic-a"), "quota": None},
+            ],
+            "eligible_count": 2,
+        }
+        await pilot.press("r")
+        await pilot.pause()
+        assert app._selected_ref == "synthetic-b"
+        assert "0%" in str(table.get_cell("synthetic-b", "primary"))
+        assert "Weight 3" in str(detail.content)
+
+        # A second all-account check clears old values before awaiting the CLI.
+        client.quota_started = asyncio.Event()
+        client.quota_gate = asyncio.Event()
+        client.quota_error = CLIError("synthetic quota failure")
+        await pilot.press("u")
+        await client.quota_started.wait()
+        await pilot.pause()
+        assert "…" in str(table.get_cell("synthetic-a", "primary"))
+        assert "…" in str(table.get_cell("synthetic-b", "primary"))
+
+        calls_while_running = sum(1 for name, _, _ in client.calls if name == "quota")
+        await pilot.press("u")
+        await pilot.pause()
+        assert sum(1 for name, _, _ in client.calls if name == "quota") == calls_while_running
+        assert "already running" in str(app.query_one("#status-line", Static).content)
+
+        client.quota_gate.set()
+        await pilot.pause()
+        assert "N/A" in str(table.get_cell("synthetic-a", "primary"))
+        assert "N/A" in str(table.get_cell("synthetic-b", "primary"))
+        assert "UNAVAILABLE" in str(detail.content)
+        assert "synthetic quota failure" in str(detail.content)
+        failed_attempt = app._quota_by_ref["synthetic-b"].attempted_at
+
+        await pilot.press("r")
+        await pilot.pause()
+        assert app._selected_ref == "synthetic-b"
+        assert app._quota_by_ref["synthetic-b"].attempted_at == failed_attempt
+        assert "synthetic quota failure" in str(detail.content)
+        assert "Quota check unavailable" in str(
+            app.query_one("#status-line", Static).content
+        )
 
 
 async def test_login_flow_shows_device_code_then_completes_and_refreshes():

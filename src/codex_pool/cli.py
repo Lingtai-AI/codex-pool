@@ -135,8 +135,14 @@ def cmd_quota(args: argparse.Namespace) -> int:
             q = r["quota"]
             primary = q["primary_used_percent"]
             primary_s = f"{primary}%" if primary is not None else "unknown"
+            remaining = q.get("primary_remaining_percent")
+            remaining_s = f"{remaining}%" if remaining is not None else "unknown"
+            status = q.get("status", "unavailable" if q.get("error") else "ok")
             err = f" error={q['error']}" if q.get("error") else ""
-            print(f"{r['ref']:<20} primary_used={primary_s}{err}")
+            print(
+                f"{r['ref']:<20} primary_remaining={remaining_s} "
+                f"primary_used={primary_s} status={status}{err}"
+            )
     return 0
 
 
