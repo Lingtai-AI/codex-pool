@@ -624,44 +624,28 @@ async def test_encrypted_reasoning_include_default_forwarded_and_preserves_calle
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "extra_headers,body_extra,expect_from",
+    "extra_headers,body_extra",
     [
-        ({}, {}, "chain_id"),
-        ({"session_id": "hdr-session-1"}, {}, "session_header"),
-        ({"thread_id": "hdr-thread-1"}, {}, "thread_header"),
-        ({"session_id": "hdr-session-2", "thread_id": "hdr-thread-2"}, {}, "session_header"),
-        (
-            {"session_id": "hdr-session-3", "thread_id": "hdr-thread-3"},
-            {"prompt_cache_key": "explicit-key"},
-            "prompt_cache_key",
-        ),
-        # No anchor header: a body-only prompt_cache_key (e.g. a generic SDK's
-        # shared/model-global key) is NOT proof of per-caller identity and
-        # must not be promoted — the chain_id fallback governs instead.
-        ({}, {"prompt_cache_key": "shared-model-wide-key"}, "chain_id"),
+        ({}, {}),
+        ({"session_id": "hdr-session"}, {}),
+        ({"thread_id": "hdr-thread"}, {}),
+        ({"session_id": "hdr-session", "thread_id": "hdr-thread"}, {"prompt_cache_key": "explicit-key"}),
+        ({}, {"prompt_cache_key": "explicit-key"}),
     ],
-    ids=[
-        "headerless_chain_id",
-        "session_header_only",
-        "thread_header_only",
-        "session_wins_over_thread",
-        "cache_key_wins_over_both_with_anchor",
-        "cache_key_only_no_anchor_falls_back_to_chain_id",
-    ],
+    ids=["plain", "session_header", "thread_header", "headers_and_cache_key", "cache_key_only"],
 )
-async def test_conversation_identity_precedence_table(tmp_path, extra_headers, body_extra, expect_from):
-    """Native anchor rule: an explicit session_id/thread_id header must be
-    present before prompt_cache_key/session_id/thread_id can be promoted to
-    the upstream identity; otherwise the proxy's own stable per-chain id
-    governs all three upstream fields (including replacing a body-only
-    cache key)."""
+async def test_pool_chain_id_is_the_only_upstream_identity(tmp_path, extra_headers, body_extra):
+    """The pool is the sole identity owner: caller session_id/thread_id
+    headers and body prompt_cache_key never override the chain id, which is
+    sent byte-identically as all three upstream fields."""
     accounts = _setup_one_account(tmp_path)
     upstream = ScriptedUpstream()
     upstream.queue_success(
         model="gpt-5-codex",
         output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
     )
-    app = create_app(accounts=accounts, chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
 
     body = {"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}], **body_extra}
     async with _client(app) as client:
@@ -673,28 +657,19 @@ async def test_conversation_identity_precedence_table(tmp_path, extra_headers, b
     assert resp.status_code == 200
     call = upstream.calls[0]
     identity = call["session_id"]
-    # Native semantics: one stable identity, byte-identical across the header
-    # pair and the body cache key.
     assert call["thread_id"] == identity
     assert call["payload"]["prompt_cache_key"] == identity
-
-    caller_supplied_values = {"hdr-session-1", "hdr-thread-1", "hdr-session-2", "hdr-thread-2", "explicit-key", "shared-model-wide-key"}
-    if expect_from == "chain_id":
-        assert identity not in caller_supplied_values
-    elif expect_from == "session_header":
-        assert identity == extra_headers["session_id"]
-    elif expect_from == "thread_header":
-        assert identity == extra_headers["thread_id"]
-    elif expect_from == "prompt_cache_key":
-        assert identity == "explicit-key"
+    assert identity not in {"hdr-session", "hdr-thread", "explicit-key"}
+    # It is exactly the id of the chain record this success committed.
+    assert list(chain_store._records) == [identity]
 
 
 @pytest.mark.asyncio
 async def test_key_only_unrelated_callers_sharing_one_cache_key_do_not_collapse(tmp_path):
-    """Two unrelated callers sending the SAME body prompt_cache_key with no
-    session_id/thread_id anchor header (an ordinary generic-SDK shape, e.g. a
-    shared/model-global key) must land on distinct upstream identities and
-    distinct affinity chains — the cache key alone is not per-caller proof."""
+    """Two unrelated callers sending the SAME body prompt_cache_key (an
+    ordinary generic-SDK shape, e.g. a shared/model-global key) must land on
+    distinct upstream identities and distinct affinity chains — a caller key
+    never selects or merges pool sessions."""
     accounts = _setup_one_account(tmp_path)
     upstream = ScriptedUpstream()
     upstream.queue_success(
@@ -736,9 +711,9 @@ async def test_key_only_unrelated_callers_sharing_one_cache_key_do_not_collapse(
 
 @pytest.mark.asyncio
 async def test_key_only_continuation_still_reuses_chain_identity(tmp_path):
-    """A key-only caller (no anchor header) on a genuine content continuation
-    still gets a stable, reused upstream identity across turns — the
-    headerless chain_id fallback, not the caller's shared cache key."""
+    """A caller sending its own body cache key on a genuine content
+    continuation still gets the pool's stable, reused chain identity across
+    turns, never the caller's shared cache key."""
     accounts = _setup_one_account(tmp_path)
     upstream = ScriptedUpstream()
     first_output = [{
@@ -891,27 +866,34 @@ async def test_scheduling_ignores_caller_session_headers_uses_content_only(tmp_p
         await client.post(
             "/v1/responses",
             headers={"Authorization": f"Bearer {API_KEY}", "session_id": "alpha"},
-            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}]},
+            json={
+                "model": "gpt-5-codex",
+                "input": [{"role": "user", "content": "hello"}],
+                "prompt_cache_key": "key-alpha",
+            },
         )
         second_input = [
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "first reply"},
             {"role": "user", "content": "continue"},
         ]
-        # A DIFFERENT caller-supplied session header on the content-prefix
-        # continuation must not break affinity: scheduling is content-only.
+        # A DIFFERENT caller-supplied session header and cache key on the
+        # content-prefix continuation must not break affinity or identity.
         await client.post(
             "/v1/responses",
-            headers={"Authorization": f"Bearer {API_KEY}", "session_id": "beta"},
-            json={"model": "gpt-5-codex", "input": second_input},
+            headers={"Authorization": f"Bearer {API_KEY}", "session_id": "beta", "thread_id": "gamma"},
+            json={"model": "gpt-5-codex", "input": second_input, "prompt_cache_key": "key-beta"},
         )
 
     assert chain_store.record_count() == 1
     assert upstream.calls[0]["account_id"] == upstream.calls[1]["account_id"] == "acct-1"
-    # The upstream identity still follows the (changed) caller header, proving
-    # headers steer only upstream metadata, never routing.
-    assert upstream.calls[0]["session_id"] == "alpha"
-    assert upstream.calls[1]["session_id"] == "beta"
+    # The pool-owned chain identity is carried unchanged across the turns;
+    # the caller's changing header/key values are ignored entirely.
+    identity = upstream.calls[0]["session_id"]
+    assert identity not in {"alpha", "beta", "gamma", "key-alpha", "key-beta"}
+    for call in upstream.calls:
+        assert call["session_id"] == call["thread_id"] == call["payload"]["prompt_cache_key"] == identity
+    assert list(chain_store._records) == [identity]
 
 
 @pytest.mark.asyncio
@@ -945,6 +927,67 @@ async def test_distinct_content_sharing_a_caller_session_header_is_not_merged(tm
     # not merge them into one affinity baseline: content, not the header, is
     # scheduling authority.
     assert chain_store.record_count() == 2
+    assert upstream.calls[0]["session_id"] != upstream.calls[1]["session_id"]
+    assert "shared" not in {upstream.calls[0]["session_id"], upstream.calls[1]["session_id"]}
+
+
+@pytest.mark.asyncio
+async def test_failed_continuation_keeps_current_record_and_retry_reuses_identity(tmp_path):
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    first_output = [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "first reply", "annotations": []}],
+    }]
+    retry_output = [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "retry reply", "annotations": []}],
+    }]
+    upstream.queue_success(model="gpt-5-codex", output=first_output)
+    upstream.queue_partial_then_fail(
+        model="gpt-5-codex",
+        partial_item={"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial"}]},
+    )
+    upstream.queue_success(model="gpt-5-codex", output=retry_output)
+    chain_store = ChainStore()
+    app = create_app(accounts=accounts, chain_store=chain_store, upstream=upstream, api_key=API_KEY)
+
+    second_input = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "continue"},
+    ]
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": [{"role": "user", "content": "hello"}]},
+        )
+        record_after_first = dict(chain_store._records)
+        failed = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": second_input},
+        )
+        # The partial/failed turn did not replace the session's current record.
+        assert chain_store._records == record_after_first
+        retry = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": "gpt-5-codex", "input": second_input},
+        )
+
+    assert (first.status_code, failed.status_code, retry.status_code) == (200, 502, 200)
+    identity = upstream.calls[0]["session_id"]
+    assert [call["session_id"] for call in upstream.calls] == [identity, identity, identity]
+    # The successful retry replaced the one record for the same id.
+    assert list(chain_store._records) == [identity]
+    assert chain_store._records[identity] != record_after_first[identity]
+    assert chain_store._records[identity].length == len(second_input) + len(retry_output)
 
 
 @pytest.mark.asyncio

@@ -49,9 +49,9 @@ class Upstream(Protocol):
         """Yield already-decoded Responses-API SSE event dicts, in order.
 
         ``session_id`` / ``thread_id`` are an optional stable per-conversation
-        cache-affinity identity resolved by the server layer (see
-        ``server._resolve_conversation_identity``); this port only forwards
-        them as request metadata and never derives or invents them itself.
+        cache-affinity identity supplied by the server layer from its routed
+        pool chain id; this port only forwards them as request metadata and
+        never derives or invents them itself.
         """
         ...
 

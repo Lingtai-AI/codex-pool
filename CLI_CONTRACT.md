@@ -97,7 +97,12 @@ observation and remains eligible.
   runs uvicorn in the foreground. The host must be `127.0.0.1`, `localhost`,
   or `::1`; remote listening is not supported. Port must be an integer in
   `1..65535`. A missing key is a nonzero JSON error, and the key is never
-  echoed.
+  echoed. `CODEX_POOL_MAX_SESSIONS` (default `100000`) is read once at startup
+  as the number of retained in-memory session records (see `CONTRACT.md`);
+  a set value that is not a positive integer is a nonzero error (the global
+  JSON error shape under `--json`) and the server does not start. `serve` is
+  a user-launched, user-supervised foreground process; no command here
+  installs, daemonizes, autostarts, or stops it.
 - `tui` and no subcommand dispatch to `codex_pool.tui.run_tui()`.
   The Textual frontend is a thin CLI subprocess client: it renders returned
   facts and sends import/login/pool/quota actions through the frozen surface.

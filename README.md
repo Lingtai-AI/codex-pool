@@ -5,10 +5,10 @@ subscription) accounts and runs a local, loopback, OpenAI-Responses-API-
 compatible server backed by that pool. An ordinary OpenAI SDK client points
 `base_url` at the local server and never sees account selection — it needs no
 session ID or Codex-specific detail to work. Toward the real Codex backend,
-the server attaches its own stable per-conversation cache-affinity identity
-to every request (upstream-only metadata, see `CONTRACT.md`); a caller may
-optionally send its own `session_id`/`thread_id` request headers to anchor
-that identity instead, but this is never required.
+the server attaches its own stable per-conversation session identity to every
+request (upstream-only metadata, see "Session identity and retention" below);
+the pool is the only owner of that identity and ignores any caller-supplied
+`prompt_cache_key` or `session_id`/`thread_id` headers.
 
 ```python
 from openai import OpenAI
@@ -26,8 +26,10 @@ through the supported device-code flow. Quota reads require the Codex CLI on
 `PATH` and use a temporary app-server process. Browser PKCE OAuth is not exposed
 by the headless CLI.
 
-Validation covers 180 isolated mocked tests and a two-turn native-request
-parity check. An isolated live toy request through the production HTTP adapter
+Offline validation covers 194 isolated mocked tests. The two-turn live
+native-request parity check below predates the pool-owned session-identity
+change; the new identity and retention behavior has not been live-validated.
+An isolated live toy request through the production HTTP adapter
 reported 0 cached tokens on the first turn and 7,168 of 7,416 input tokens on
 its continuation; this is bounded provider evidence, not a quota/billing or
 resident-agent migration claim. Live OAuth and native Windows/Linux terminal
@@ -77,6 +79,49 @@ CODEX_POOL_API_KEY="<choose-a-strong-local-key>" codex-pool serve --listen 127.0
 
 `CODEX_POOL_HOME` overrides the data-root (default `~/.codex-pool`); tests
 always set it to an isolated temp directory.
+
+## Running the server (user-managed)
+
+You install, configure, launch, and supervise `codex-pool serve` yourself.
+It is an ordinary foreground process; codex-pool ships no daemon, service
+unit, autostart, or start/stop command. Clients, including LingTai, are
+ordinary stateless Responses clients: they point `base_url` at the server and
+do not install, start, stop, monitor, or restart it, and they do not supply or
+track a pool session ID. Use your own terminal, tmux, or service manager if you
+want it kept running.
+
+Before starting any client:
+
+1. Install from source (above); there is no package-index release.
+2. Import or device-login at least one account, and check that
+   `codex-pool status --json` reports `eligible_count` of at least 1.
+3. Start the server on a loopback address with a local access key:
+   `CODEX_POOL_API_KEY="<choose-a-strong-local-key>" codex-pool serve --listen 127.0.0.1:8765`
+4. Wait until `GET http://127.0.0.1:8765/health` returns `{"status":"ok"}`,
+   then configure clients with `base_url="http://127.0.0.1:8765/v1"` and the
+   same key.
+
+The TUI is a separate frontend and does not start or stop `serve`. If `serve`
+exits, clients get connection errors until you restart it.
+
+## Session identity and retention
+
+The pool alone owns upstream session identity. For each request it first finds
+the conversation's current record by content: the full input prefix under the
+same effective config. That record's session ID is a stable label. It is sent
+upstream as `prompt_cache_key`, `session_id`, and `thread_id`, and it keeps the
+conversation's account affinity. A new conversation gets an ID from the
+current time plus secure random bits, never from its content. Uniqueness is
+probabilistic, not guaranteed by the clock. Continuations keep the existing
+ID. Only a successful, completed response updates the record, and a failed or
+partial one leaves it unchanged.
+
+The server keeps the latest `CODEX_POOL_MAX_SESSIONS` session records (default
+100000, a positive integer read once when `serve` starts). When that limit is
+exceeded, the least recently updated session is evicted. Records live only in
+memory: after eviction or a restart, that conversation's next request is
+load-balanced and gets a new session ID. See `CONTRACT.md` for the exact
+semantics.
 
 ## Architecture
 
