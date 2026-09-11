@@ -65,26 +65,49 @@ flow.
 - `status --json` prints `{"accounts":[<status with authenticated>...],"eligible_count":N}`.
   `eligible_count` counts enabled, authenticated accounts that are not known
   exhausted. Unknown quota remains eligible; no liveness claim is included.
-- `quota --json` reads each imported account through a throwaway `codex
-  app-server` JSON-RPC process and prints:
+- `quota --json` reads each imported account with one direct read-only
+  `GET https://chatgpt.com/backend-api/wham/usage` and prints:
 
 ```json
 {"accounts":[{"ref":"example","quota":{
   "primary_used_percent":30,
   "secondary_used_percent":null,
-  "primary_reset_at":null,
+  "primary_reset_at":"2026-09-10T05:00:00+00:00",
   "secondary_reset_at":null,
-  "observed_at":"2026-09-10T04:55:00+00:00"
+  "observed_at":"2026-09-10T04:55:00+00:00",
+  "status":"ok",
+  "primary_remaining_percent":70,
+  "secondary_remaining_percent":null,
+  "primary_window_name":"burst",
+  "secondary_window_name":null,
+  "primary_window_duration_mins":300,
+  "secondary_window_duration_mins":null
 }}]}
 ```
 
-`primary_used_percent` is the source-verified
-`rateLimits.primary.usedPercent` field. The symmetric secondary field is
-parsed defensively when present but is not source-verified. Reset timestamps
-are always null because no field name exists in the available source. Per-
-account failures keep all numeric values null (never zero), add a short
-nonsecret `error` reason, and do not fail other accounts or imply exhaustion.
-`observed_at` is always a real UTC ISO-8601 timestamp.
+Actual `limit_window_seconds` is converted to minutes when provider minute fields are absent; no window length is assumed.
+
+The reader uses the existing flat access token and, when present, account ID
+from the imported auth file. It does not refresh or modify that file, perform
+login, retry, follow redirects, use another account, fall back to a subprocess,
+or materialize tokens in a temporary home.
+
+WHAM's `rate_limit` / `rateLimits` payload supplies `primary_window` and
+`secondary_window` (with the source-backed `primary` / `secondary` structural
+variant). Used percentage accepts the source's snake/camel spellings, must be
+finite and in `0..100`, and preserves a real zero. Remaining is
+`max(0, 100 - used)` only when used is valid; it is not aggregate account
+balance. Reset timestamps are normalized from finite nonnegative Unix seconds
+to UTC ISO-8601. Window name and duration preserve only actual returned facts;
+the CLI never invents a 5-hour, weekly, or other label/default.
+
+A successful response containing a rate-limit object has `status:"ok"`; an
+empty window remains successful with unknown (`null`) facts. HTTP failures
+(including 429/unauthenticated responses), transport errors, invalid JSON, and
+missing/malformed quota objects have `status:"unavailable"`, keep every quota
+fact null (never zero), and add a short nonsecret `error` reason. A failure for
+one account does not fail other accounts. `observed_at` is always a real UTC
+ISO-8601 timestamp, including for unavailable results.
 
 A reading proving primary or secondary usage is 100% is stored as the
 package's small quota observation and makes that account ineligible until a
@@ -106,4 +129,10 @@ observation and remains eligible.
 - `tui` and no subcommand dispatch to `codex_pool.tui.run_tui()`.
   The Textual frontend is a thin CLI subprocess client: it renders returned
   facts and sends import/login/pool/quota actions through the frozen surface.
-  It never reads auth/token files or performs provider calls.
+  It never reads auth/token files or performs provider calls. The table derives
+  primary/secondary remaining meters only from validated used percentages;
+  the detail pane renders the existing flat reset/observation fields and the
+  additive flat window names/durations. `u` explicitly checks all accounts and
+  clears their old presentation while loading; `r` refreshes metadata only and
+  preserves ref-keyed quota presentation. Selection, resize, and render never
+  trigger a quota command, and no timer or automatic retry exists.

@@ -50,10 +50,12 @@ error/redaction behavior, and the local CLI/TUI boundary).
   from the shipping LingTai TUI OAuth source. It is dependency-injected for
   mocked HTTP tests, writes the resulting token bundle atomically, and emits
   only the pinned authorization/completed JSONL events.
-- `src/codex_pool/quota.py` — Codex CLI `app-server` JSON-RPC quota reader,
-  adapted from the LingTai kernel quota source. Uses an owned temporary
-  `CODEX_HOME`, never mutates the account auth file, and reports unknown data
-  as `None` rather than zero.
+- `src/codex_pool/quota.py` — direct read-only WHAM quota reader. Reads the
+  existing flat access-token/account-id facts, performs one dependency-
+  injected HTTP GET, and normalizes actual primary/secondary window usage,
+  remaining, reset, label, and duration facts. It never refreshes or writes
+  auth, retries, falls back, starts Codex, or copies credentials to a
+  temporary home; unavailable/unknown data remains `None`, never zero.
 - `src/codex_pool/hashing.py` — `canonical_json`, `item_hash`,
   `rolling_hashes`, `extend_hash`, `config_hash`: order-preserving content
   hashing with the narrow plain-assistant equivalence in `CONTRACT.md`, used
@@ -90,9 +92,12 @@ error/redaction behavior, and the local CLI/TUI boundary).
 - `src/codex_pool/cli_client.py` — thin async subprocess wrapper for the
   frozen CLI JSON/JSONL contract. Owns child cleanup and never provider/auth
   logic.
-- `src/codex_pool/tui.py` — thin Textual frontend. Renders CLI facts and sends
-  all actions through `CLIClient`; it does not read account/auth/provider
-  state directly.
+- `src/codex_pool/tui.py` — thin Textual frontend. Renders CLI facts as a
+  familiar account-management table with per-window remaining meters and a
+  selected-account detail pane. Its ref-keyed quota presentation state is
+  process-local and separates metadata refresh from explicit all-account
+  quota checks. All actions go through `CLIClient`; it does not read account,
+  auth, or provider state directly and does not poll automatically.
 - `src/codex_pool/cli.py` — command composition root: account import/list/
   device login, pool mutations, status, quota, serve (validates
   `CODEX_POOL_MAX_SESSIONS` at startup), and TUI dispatch. See
@@ -130,8 +135,9 @@ arguments, which lets tests inject a fake upstream.
 - Ephemeral service state: `ChainStore._records` is process-local memory
   bounded by `CODEX_POOL_MAX_SESSIONS` and is lost on restart. No
   response/session transcript is stored.
-- Quota reads use a process-owned temporary native Codex home that is cleaned
-  after each read; it is not the package's persistent state.
+- Quota reads have no additional state: each read uses the account's existing
+  auth file in place, once, and performs one direct WHAM request. No token or
+  provider payload is persisted.
 
 ## Notes
 

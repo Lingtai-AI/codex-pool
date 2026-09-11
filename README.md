@@ -22,11 +22,12 @@ print(response.output_text)
 
 This is an early standalone implementation, not a published package release.
 Accounts can be imported from an explicit Codex OAuth auth-file or logged in
-through the supported device-code flow. Quota reads require the Codex CLI on
-`PATH` and use a temporary app-server process. Browser PKCE OAuth is not exposed
-by the headless CLI.
+through the supported device-code flow. Quota reads make one direct read-only
+WHAM request with the existing account token; they do not refresh or write
+auth, retry, start Codex, or copy credentials. Browser PKCE OAuth is not
+exposed by the headless CLI.
 
-Offline validation covers 194 isolated mocked tests. The two-turn live
+Offline validation uses isolated mocked tests. The two-turn live
 native-request parity check below predates the pool-owned session-identity
 change; the new identity and retention behavior has not been live-validated.
 An isolated live toy request through the production HTTP adapter
@@ -58,6 +59,12 @@ Run `codex-pool` or `codex-pool tui` for the Textual interface. It is a frontend
 to the same CLI: account import/device login, enable/disable, weights, status,
 and quota. It does not implement a second auth or routing layer. Run
 `codex-pool serve` separately for the local Responses server.
+
+The accounts table shows independent primary and secondary **remaining**
+meters, with actual window/reset/observation facts in the selected-account
+detail. Press `u` to check quota for all accounts; press `r` to refresh account
+metadata only. There is no automatic quota polling, retry, inferred window
+name, or aggregate pool balance.
 
 For device-code login, run `codex-pool accounts login personal --device` and
 follow the displayed authorization URL/code. Do not share the code or auth-file

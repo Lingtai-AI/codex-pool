@@ -133,6 +133,9 @@ An account is eligible only if it is enabled, has a valid auth file (or can
 refresh one), and has no persisted observation proving quota exhaustion. A
 quota read with no reliable numeric value clears the observation to unknown,
 which remains eligible. Refreshing a token does not change account identity.
+The explicit `quota` command is narrower than request authentication: it reads
+the existing access token in place and makes one read-only WHAM request, with
+no refresh, login, retry, subprocess, or fallback behavior.
 
 ## Errors and state
 
