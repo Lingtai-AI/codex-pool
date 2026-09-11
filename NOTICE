@@ -9,6 +9,16 @@ The adapted files live at `src/codex_pool/auth_codex.py`,
 `src/codex_pool/quota.py`, and `src/codex_pool/device_login.py`; each carries
 its own header pointing back here.
 
+`src/codex_pool/upstream.py`'s Codex cache-affinity request metadata (the
+underscored `session_id`/`thread_id` header names and the
+`x-codex-turn-metadata` JSON shape) reproduces wire-protocol facts read from
+the same LingTai kernel's `src/lingtai/llm/openai/adapter.py`
+(`_cache_affinity_headers` / `_codex_metadata_headers`). No source code from
+that file was copied; only the documented field names/shapes needed to speak
+the same upstream wire protocol were reimplemented independently, with
+codex-pool's own honest client identity (never LingTai's or the official
+Codex CLI's).
+
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
   You may obtain a copy of the License at

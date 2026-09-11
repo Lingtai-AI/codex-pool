@@ -109,8 +109,24 @@ class ScriptedUpstream:
         """Emit completed status with no output field or done items."""
         self.turns.append(("completed_unobservable", model, response_id))
 
-    async def stream(self, *, access_token: str, account_id: str | None, payload: dict) -> AsyncIterator[dict]:
-        self.calls.append({"access_token": access_token, "account_id": account_id, "payload": payload})
+    async def stream(
+        self,
+        *,
+        access_token: str,
+        account_id: str | None,
+        payload: dict,
+        session_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> AsyncIterator[dict]:
+        self.calls.append(
+            {
+                "access_token": access_token,
+                "account_id": account_id,
+                "payload": payload,
+                "session_id": session_id,
+                "thread_id": thread_id,
+            }
+        )
         if not self.turns:
             raise AssertionError("ScriptedUpstream: no more turns queued")
         turn = self.turns.pop(0)

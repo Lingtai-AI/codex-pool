@@ -3,8 +3,12 @@
 A standalone Python package: a CLI that manages a pool of Codex (ChatGPT
 subscription) accounts and runs a local, loopback, OpenAI-Responses-API-
 compatible server backed by that pool. An ordinary OpenAI SDK client points
-`base_url` at the local server; it never sees account selection, session
-IDs, or Codex-specific details.
+`base_url` at the local server and never sees account selection — it needs no
+session ID or Codex-specific detail to work. Toward the real Codex backend,
+the server attaches its own stable per-conversation cache-affinity identity
+to every request (upstream-only metadata, see `CONTRACT.md`); a caller may
+optionally send its own `session_id`/`thread_id` request headers to anchor
+that identity instead, but this is never required.
 
 ```python
 from openai import OpenAI
@@ -22,10 +26,12 @@ through the supported device-code flow. Quota reads require the Codex CLI on
 `PATH` and use a temporary app-server process. Browser PKCE OAuth is not exposed
 by the headless CLI.
 
-Validation covers 157 isolated mocked tests, plus a two-turn actual LingTai
-generic Responses client against a mocked upstream. Live OAuth, subscription
-quota/provider acceptance, and native Windows/Linux terminal use have not been
-validated. See `CONTRACT.md` and `CLI_CONTRACT.md` for supported behavior and
+Validation covers 180 isolated mocked tests and a two-turn native-request
+parity check. An isolated live toy request through the production HTTP adapter
+reported 0 cached tokens on the first turn and 7,168 of 7,416 input tokens on
+its continuation; this is bounded provider evidence, not a quota/billing or
+resident-agent migration claim. Live OAuth and native Windows/Linux terminal
+use have not been validated. See `CONTRACT.md` and `CLI_CONTRACT.md` for supported behavior and
 explicit exclusions; this is not a complete implementation of every Responses
 API option.
 
