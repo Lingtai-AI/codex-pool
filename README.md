@@ -117,7 +117,7 @@ ID. Only a successful, completed response updates the record, and a failed or
 partial one leaves it unchanged.
 
 The server keeps the latest `CODEX_POOL_MAX_SESSIONS` session records (default
-10000, a positive integer read once when `serve` starts). When that limit is
+100000, a positive integer read once when `serve` starts). When that limit is
 exceeded, the least recently updated session is evicted. Records live only in
 memory: after eviction or a restart, that conversation's next request is
 load-balanced and gets a new session ID. See `CONTRACT.md` for the exact

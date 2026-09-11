@@ -31,7 +31,7 @@ from .hashing import extend_hash, rolling_hashes
 
 # Default number of most-recently-committed session records retained;
 # `codex-pool serve` overrides it from CODEX_POOL_MAX_SESSIONS at startup.
-DEFAULT_MAX_SESSIONS = 10000
+DEFAULT_MAX_SESSIONS = 100000
 
 
 def new_session_id() -> str:

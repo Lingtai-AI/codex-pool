@@ -61,7 +61,7 @@ error/redaction behavior, and the local CLI/TUI boundary).
 - `src/codex_pool/chain.py` — `ChainStore`, `Baseline`, `MatchResult`,
   `new_session_id`, `DEFAULT_MAX_SESSIONS`: bounded in-memory
   one-current-record-per-chain table (latest N by commit order, default
-  10000). Issues the pool-owned time+random session id for each new chain,
+  100000). Issues the pool-owned time+random session id for each new chain,
   never reusing a retained id. `commit()` replaces the current record under
   one lock; a new chain's first commit never overwrites a retained id.
 - `src/codex_pool/routing.py` — `select_account`, `weighted_choice`,

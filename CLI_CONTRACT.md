@@ -97,7 +97,7 @@ observation and remains eligible.
   runs uvicorn in the foreground. The host must be `127.0.0.1`, `localhost`,
   or `::1`; remote listening is not supported. Port must be an integer in
   `1..65535`. A missing key is a nonzero JSON error, and the key is never
-  echoed. `CODEX_POOL_MAX_SESSIONS` (default `10000`) is read once at startup
+  echoed. `CODEX_POOL_MAX_SESSIONS` (default `100000`) is read once at startup
   as the number of retained in-memory session records (see `CONTRACT.md`);
   a set value that is not a positive integer is a nonzero error (the global
   JSON error shape under `--json`) and the server does not start. `serve` is

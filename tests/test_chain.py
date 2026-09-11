@@ -231,8 +231,8 @@ def test_fresh_commit_never_overwrites_a_session_retained_after_find_match(monke
     assert (match_b.chain_id, match_b.account_ref) == ("replacement", "acct-b")
 
 
-def test_default_capacity_is_ten_thousand_sessions():
-    assert DEFAULT_MAX_SESSIONS == 10000
+def test_default_capacity_is_hundred_thousand_sessions():
+    assert DEFAULT_MAX_SESSIONS == 100000
     assert ChainStore()._max_records == DEFAULT_MAX_SESSIONS
 
 

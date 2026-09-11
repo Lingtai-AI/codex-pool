@@ -43,7 +43,7 @@ hold that lock only during the final commit.
 
 ### Retained sessions
 
-The table retains at most N current session records, default 10000.
+The table retains at most N current session records, default 100000.
 `codex-pool serve` reads `CODEX_POOL_MAX_SESSIONS` once at startup; a set
 value must be a positive integer, otherwise `serve` exits with an ordinary CLI
 error before listening. There is no runtime reload, TTL, persistent storage,

@@ -176,11 +176,11 @@ def _capture_serve(monkeypatch):
     return created, runs
 
 
-def test_serve_max_sessions_defaults_to_ten_thousand(monkeypatch):
+def test_serve_max_sessions_defaults_to_hundred_thousand(monkeypatch):
     monkeypatch.delenv("CODEX_POOL_MAX_SESSIONS", raising=False)
     created, runs = _capture_serve(monkeypatch)
     assert cli.main(["serve", "--api-key", "x", "--json"]) == 0
-    assert created["chain_store"]._max_records == 10000
+    assert created["chain_store"]._max_records == 100000
     assert len(runs) == 1
 
 
