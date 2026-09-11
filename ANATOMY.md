@@ -58,9 +58,12 @@ error/redaction behavior, and the local CLI/TUI boundary).
   `rolling_hashes`, `extend_hash`, `config_hash`: order-preserving content
   hashing with the narrow plain-assistant equivalence in `CONTRACT.md`, used
   only as a routing index.
-- `src/codex_pool/chain.py` — `ChainStore`, `Baseline`, `MatchResult`: bounded
-  in-memory one-current-record-per-chain table. `commit()` unconditionally
-  replaces the current record under one lock.
+- `src/codex_pool/chain.py` — `ChainStore`, `Baseline`, `MatchResult`,
+  `new_session_id`, `DEFAULT_MAX_SESSIONS`: bounded in-memory
+  one-current-record-per-chain table (latest N by commit order, default
+  10000). Issues the pool-owned time+random session id for each new chain,
+  never reusing a retained id. `commit()` replaces the current record under
+  one lock; a new chain's first commit never overwrites a retained id.
 - `src/codex_pool/routing.py` — `select_account`, `weighted_choice`,
   `eligible_refs`: full-prefix affinity and weighted load balancing over
   authenticated, enabled, non-exhausted accounts.
@@ -80,9 +83,10 @@ error/redaction behavior, and the local CLI/TUI boundary).
   normalization/validation, routing, upstream driving, streaming versus
   aggregated response shaping, and commit-on-complete success. Also resolves
   the native-parity `reasoning.encrypted_content` include default (applied
-  before config hashing) and the per-conversation cache-affinity identity
-  (`_resolve_conversation_identity`) forwarded to `upstream.py`. Identity is
-  routing-blind; effective include participates in config-based affinity.
+  before config hashing) and forwards the routed chain id to `upstream.py` as
+  the sole upstream session identity; caller `prompt_cache_key` and
+  `session_id`/`thread_id` headers never override it. Effective include
+  participates in config-based affinity.
 - `src/codex_pool/cli_client.py` — thin async subprocess wrapper for the
   frozen CLI JSON/JSONL contract. Owns child cleanup and never provider/auth
   logic.
@@ -90,7 +94,8 @@ error/redaction behavior, and the local CLI/TUI boundary).
   all actions through `CLIClient`; it does not read account/auth/provider
   state directly.
 - `src/codex_pool/cli.py` — command composition root: account import/list/
-  device login, pool mutations, status, quota, serve, and TUI dispatch. See
+  device login, pool mutations, status, quota, serve (validates
+  `CODEX_POOL_MAX_SESSIONS` at startup), and TUI dispatch. See
   `CLI_CONTRACT.md` for the stable machine surface.
 
 ## Connections
@@ -122,8 +127,9 @@ arguments, which lets tests inject a fake upstream.
   account refs, explicit auth-file paths, enabled/weight, and the small
   quota-exhaustion observation. The account's referenced auth file is owned
   by its writer; `auth_codex.py` refreshes it in place.
-- Ephemeral service state: `ChainStore._records` is bounded process-local
-  memory and is lost on restart. No response/session transcript is stored.
+- Ephemeral service state: `ChainStore._records` is process-local memory
+  bounded by `CODEX_POOL_MAX_SESSIONS` and is lost on restart. No
+  response/session transcript is stored.
 - Quota reads use a process-owned temporary native Codex home that is cleaned
   after each read; it is not the package's persistent state.
 

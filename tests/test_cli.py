@@ -162,6 +162,59 @@ def test_serve_requires_api_key(capsys, monkeypatch):
     assert "api-key" in payload["error"] or "api_key" in payload["error"]
 
 
+def _capture_serve(monkeypatch):
+    """Record what `serve` would construct/run without binding a socket."""
+    created: dict = {}
+    runs: list = []
+
+    def fake_create_app(**kwargs):
+        created.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("codex_pool.server.create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: runs.append(kwargs))
+    return created, runs
+
+
+def test_serve_max_sessions_defaults_to_ten_thousand(monkeypatch):
+    monkeypatch.delenv("CODEX_POOL_MAX_SESSIONS", raising=False)
+    created, runs = _capture_serve(monkeypatch)
+    assert cli.main(["serve", "--api-key", "x", "--json"]) == 0
+    assert created["chain_store"]._max_records == 10000
+    assert len(runs) == 1
+
+
+def test_serve_reads_max_sessions_from_env_at_startup(monkeypatch):
+    monkeypatch.setenv("CODEX_POOL_MAX_SESSIONS", "3")
+    created, runs = _capture_serve(monkeypatch)
+    assert cli.main(["serve", "--api-key", "x", "--json"]) == 0
+    assert created["chain_store"]._max_records == 3
+    assert len(runs) == 1
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "abc", "1.5", ""])
+def test_serve_rejects_invalid_max_sessions_with_json_error(capsys, monkeypatch, raw):
+    monkeypatch.setenv("CODEX_POOL_MAX_SESSIONS", raw)
+    created, runs = _capture_serve(monkeypatch)
+    assert cli.main(["serve", "--api-key", "x", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert "CODEX_POOL_MAX_SESSIONS" in payload["error"]
+    assert "positive integer" in payload["error"]
+    assert created == {} and runs == []
+
+
+def test_serve_rejects_invalid_max_sessions_in_human_mode(capsys, monkeypatch):
+    monkeypatch.setenv("CODEX_POOL_MAX_SESSIONS", "0")
+    created, runs = _capture_serve(monkeypatch)
+    assert cli.main(["serve", "--api-key", "x"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "CODEX_POOL_MAX_SESSIONS" in err
+    assert created == {} and runs == []
+
+
 def test_status_reports_malformed_auth_as_unavailable(capsys, tmp_path):
     auth = tmp_path / "malformed.json"
     auth.write_text("null", encoding="utf-8")

@@ -203,9 +203,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    import os
+
     import uvicorn
 
-    from .chain import ChainStore
+    from .chain import DEFAULT_MAX_SESSIONS, ChainStore
     from .server import create_app
     from .upstream import CodexHTTPUpstream
 
@@ -227,9 +229,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not (1 <= port <= 65535):
         return _error(f"invalid --listen port: {port} (must be 1-65535)", as_json=args.json)
 
+    # Read once at startup; there is no runtime reload.
+    raw_max_sessions = os.environ.get("CODEX_POOL_MAX_SESSIONS")
+    if raw_max_sessions is None:
+        max_sessions = DEFAULT_MAX_SESSIONS
+    else:
+        try:
+            max_sessions = int(raw_max_sessions)
+        except ValueError:
+            max_sessions = 0
+        if max_sessions < 1:
+            return _error(
+                f"invalid CODEX_POOL_MAX_SESSIONS value: {raw_max_sessions!r} (must be a positive integer)",
+                as_json=args.json,
+            )
+
     app = create_app(
         accounts=AccountStore(),
-        chain_store=ChainStore(),
+        chain_store=ChainStore(max_records=max_sessions),
         upstream=CodexHTTPUpstream(),
         api_key=api_key,
     )

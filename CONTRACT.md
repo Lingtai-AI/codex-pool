@@ -12,16 +12,17 @@
    pool accounts.
 
 There is no caller/session identifier and no client-visible concept of which
-account served a request: routing itself reads only request content
-(`input`/config-effective fields) and never any caller-supplied identity —
-see "Upstream cache-affinity identity" below for the narrow, routing-blind
-exception. Quota data that is unavailable or unknown never excludes an
-account; only an explicit exhausted observation does.
+account served a request: routing reads only request content
+(`input`/config-effective fields) and never any caller-supplied identity. The
+upstream session identity is pool-owned (see "Upstream session identity"
+below). Quota data that is unavailable or unknown never excludes an account;
+only an explicit exhausted observation does.
 
 ## One current record per chain
 
-Each affinity chain has at most one current record (content digest, length,
-configuration digest, and account reference) at any time. This is not a
+Each affinity chain (one inferred conversation, i.e. one pool session) has at
+most one current record (content digest, length, configuration digest, and
+account reference) at any time, keyed by its session id. This is not a
 persisted transcript:
 
 - A successful, complete turn replaces that one record.
@@ -39,6 +40,19 @@ persisted transcript:
 In short: an ordinary atomic dictionary update (`dict[chain_id] = new_record`)
 under one lock, with no compare-and-swap or version table. Streaming responses
 hold that lock only during the final commit.
+
+### Retained sessions
+
+The table retains at most N current session records, default 10000.
+`codex-pool serve` reads `CODEX_POOL_MAX_SESSIONS` once at startup; a set
+value must be a positive integer, otherwise `serve` exits with an ordinary CLI
+error before listening. There is no runtime reload, TTL, persistent storage,
+or second capacity setting. A continuation's successful commit updates its
+session's one record in place (no record per turn) and makes it the most
+recently updated. When a new session's first successful commit would exceed
+N, the least recently successfully updated session is evicted. Eviction or a
+process restart loses that conversation's affinity and session id: its next
+request misses, is load-balanced, and starts a new session id.
 
 ## Input and upstream request shape
 
@@ -80,36 +94,38 @@ see this same effective `include` list, so this default cannot desync
 affinity matching from what is actually sent. Unsupported non-null `include`
 types (other than string or array) are rejected rather than silently discarded.
 
-### Upstream cache-affinity identity
+### Upstream session identity
 
-Independent of scheduling, the proxy resolves one stable per-conversation
-identity per request and sends it upstream as the literal, underscored
-`session_id` and `thread_id` HTTP headers plus the body `prompt_cache_key`
-field (all three byte-identical), matching native Codex REST cache-affinity
-behavior.
+Clients are ordinary stateless Responses clients: they send no pool-specific
+session id and track none. The pool is the sole owner of the upstream session
+identity, in two separate steps:
 
-Precedence requires an explicit anchor: a body `prompt_cache_key` only wins,
-and identity is only promoted to the `session_id`/`thread_id` headers, when
-the caller *also* sends an explicit `session_id` or `thread_id` request
-header. An ordinary Responses body `prompt_cache_key` alone (for example a
-generic SDK's shared/model-global cache key) is not proof of per-caller
-identity and is never promoted on its own — doing so could collapse unrelated
-callers who happen to share one key onto the same upstream cache slot. Given
-an anchor header, precedence is: explicit body `prompt_cache_key` first, else
-`session_id`, else `thread_id`.
+1. **Content lookup.** The full-prefix + effective-config match above
+   recovers the conversation's current record; no id from the client is
+   involved.
+2. **Stable label.** That record's session id (its chain id) is sent upstream
+   byte-identically as the literal, underscored `session_id` and `thread_id`
+   HTTP headers and the body `prompt_cache_key`, matching native Codex REST
+   cache-affinity behavior. A sticky continuation carries the existing id; a
+   request that matches nothing gets a new id.
 
-Ordinary callers that send no anchor header get the proxy's own per-chain id
-instead — reused on prefix continuation, fresh on no-match — substituted for
-*all three* upstream identity fields, including replacing any caller-supplied
-body `prompt_cache_key`. This headerless substitution is an explicit
-owner-layer adaptation for ordinary SDK clients: native bare construction
-keeps a body-only key without identity headers. Here, no-match requests get
-distinct identities even when their body-only cache keys are equal; actual
-content-prefix continuations reuse the existing chain identity.
+A new id is generated once per new inferred chain and is independent of
+conversation content: Unix milliseconds (from `time.time_ns()`) plus 74
+cryptographically secure random bits, in UUIDv7 text layout. Two
+conversations with identical openings therefore get different ids.
+Uniqueness is probabilistic — it rests on the random bits, not on the clock.
+The pool additionally never issues or first-commits a new chain under an id
+it currently retains, so a collision never overwrites another session's
+record; in the improbable case that the colliding id became retained between a
+new chain's request and its first commit, that chain is stored under a freshly
+drawn id and its next turn uses that id.
 
-This identity is read-only input to the upstream request; it is never used
-for and never overrides the two scheduling rules above, and no new required
-header is introduced (both headers remain optional).
+A caller's body `prompt_cache_key` is always replaced, and caller
+`session_id`/`thread_id` request headers are not read. None of them selects
+an account, overrides the pool identity, or merges or splits sessions. The
+session id binds one conversation's account affinity only through its record;
+routing still follows only the two scheduling rules above, so an account that
+becomes ineligible falls through to weighted load balancing and a new session.
 
 ## Eligibility and authentication
 
@@ -128,7 +144,7 @@ which remains eligible. Refreshing a token does not change account identity.
   `response.output_item.done` items are preserved even if a terminal trailer's
   `response.output` is empty.
 - No response/session transcript is persisted. Chain records live only in
-  bounded process memory and are lost on restart.
+  bounded process memory (see "Retained sessions") and are lost on restart.
 - Account/pool settings and the small quota-exhaustion observation live in the
   package's own `pool.json`; auth credentials remain in the explicitly
   referenced auth file and are never included in status or errors.
