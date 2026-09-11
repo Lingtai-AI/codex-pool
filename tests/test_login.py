@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from codex_pool.accounts import AccountError, AccountStore
-from codex_pool.device_login import (
+from subs_pool.modules.codex.accounts import AccountError, AccountStore
+from subs_pool.modules.codex.device_login import (
     DEVICE_AUTH_TIMEOUT_SECONDS,
     DEVICE_TOKEN_URL,
     DEVICE_USERCODE_URL,
@@ -83,7 +83,6 @@ def test_device_login_success_flow(tmp_path):
     assert account["weight"] == 3
     assert account["enabled"] is True
     assert account["auth_present"] is True
-    assert account["quota"] == "unknown"
 
     # No secret ever appears in the emitted event stream.
     dumped = json.dumps(events)

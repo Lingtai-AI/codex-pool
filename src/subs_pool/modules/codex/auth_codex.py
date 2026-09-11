@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
 import httpx
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -55,6 +57,14 @@ class CodexAuthFormatError(CodexAuthError):
     """Raised for a syntactically valid but structurally invalid auth file."""
 
 
+class CodexRequestTimeout(CodexAuthError):
+    """A shared Codex request reached its absolute deadline."""
+
+
+class CodexRequestCancelled(CodexRequestTimeout):
+    """A shared Codex request observed cooperative cancellation."""
+
+
 _STRING_AUTH_FIELDS = (
     "access_token",
     "refresh_token",
@@ -78,21 +88,177 @@ def _validated_auth_data(data: object) -> dict:
     return data
 
 
+async def _request_json_async(
+    method: str,
+    url: str,
+    *,
+    transport: httpx.BaseTransport | None,
+    absolute_deadline: float,
+    monotonic_fn,
+    cancel_event: threading.Event | None,
+    headers: dict[str, str] | None,
+    data: dict[str, str] | None,
+) -> httpx.Response:
+    """Own one cancellable HTTPX request and its response lifetime."""
+
+    def remaining() -> float:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CodexRequestCancelled("Codex request was cancelled.")
+        value = absolute_deadline - monotonic_fn()
+        if value <= 0:
+            raise CodexRequestTimeout("Codex request exceeded its deadline.")
+        return value
+
+    async def receive() -> httpx.Response:
+        timeout = httpx.Timeout(remaining())
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            transport=transport,
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            async with client.stream(method, url, headers=headers, data=data) as live:
+                chunks: list[bytes] = []
+                async for chunk in live.aiter_bytes():
+                    remaining()
+                    chunks.append(chunk)
+                remaining()
+                return httpx.Response(
+                    live.status_code,
+                    headers=live.headers,
+                    content=b"".join(chunks),
+                    request=live.request,
+                )
+
+    async def cancel_or_deadline() -> None:
+        # A threading.Event cannot be awaited directly. This watcher is paired
+        # with task cancellation, so a blocked async header/body read is
+        # actively unwound instead of merely being checked after it returns.
+        while True:
+            remaining()
+            await asyncio.sleep(min(0.01, remaining()))
+
+    receive_task = asyncio.create_task(receive())
+    control_task = asyncio.create_task(cancel_or_deadline())
+    done, _ = await asyncio.wait(
+        (receive_task, control_task),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if receive_task in done:
+        control_task.cancel()
+        await asyncio.gather(control_task, return_exceptions=True)
+        return receive_task.result()
+
+    reason = control_task.exception()
+    receive_task.cancel()
+    await asyncio.gather(receive_task, return_exceptions=True)
+    if isinstance(reason, (CodexRequestCancelled, CodexRequestTimeout)):
+        raise reason
+    raise CodexRequestTimeout("Codex request exceeded its deadline.")
+
+
+def request_json(
+    method: str,
+    url: str,
+    *,
+    transport: httpx.BaseTransport | None,
+    timeout_seconds: float,
+    deadline: float | None = None,
+    monotonic_fn=time.monotonic,
+    cancel_event: threading.Event | None = None,
+    headers: dict[str, str] | None = None,
+    data: dict[str, str] | None = None,
+) -> httpx.Response:
+    """Make one owned Codex request under one absolute budget.
+
+    The sync API runs an owned async task in the calling quota worker. A
+    deadline/cancellation watcher cancels that task, which unwinds HTTPX's
+    header/body operation and its client/response context managers. No helper
+    thread, retry, or abandoned request is used.
+    """
+
+    # A direct caller that does not supply a shared deadline still gets one
+    # absolute request budget. HTTPX's timeout remains an inactivity guard,
+    # while this deadline governs the complete streamed body.
+    absolute_deadline = deadline if deadline is not None else monotonic_fn() + timeout_seconds
+    try:
+        response = asyncio.run(
+            _request_json_async(
+                method,
+                url,
+                transport=transport,
+                absolute_deadline=absolute_deadline,
+                monotonic_fn=monotonic_fn,
+                cancel_event=cancel_event,
+                headers=headers,
+                data=data,
+            )
+        )
+    except (CodexRequestTimeout, CodexRequestCancelled):
+        raise
+    except httpx.TimeoutException:
+        raise CodexRequestTimeout("Codex request timed out.") from None
+    return response
+
+
 class CodexTokenManager:
     """Manages a single Codex OAuth token file identified by an explicit path.
 
     Unlike the original kernel version there is no ``LINGTAI_TUI_DIR``
-    fallback: a codex-pool account's auth path always comes from the account
-    record created by ``codex-pool accounts import``.
+    fallback: a Codex module account's auth path always comes from the account
+    record created by ``subspool codex account import``.
     """
 
-    def __init__(self, token_path: str) -> None:
+    def __init__(
+        self,
+        token_path: str,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        time_fn=time.time,
+        monotonic_fn=time.monotonic,
+        refresh_timeout: float = 30.0,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         if not token_path:
             raise ValueError("token_path is required")
         self._path = Path(token_path).expanduser()
         self._lock_path = self._path.with_suffix(".json.lock")
         self._cache: dict | None = None
         self._cache_mtime: float = 0.0
+        self._transport = transport
+        self._time = time_fn
+        self._monotonic = monotonic_fn
+        self._refresh_timeout = refresh_timeout
+        self._deadline = deadline if deadline is not None else monotonic_fn() + refresh_timeout
+        self._cancel_event = cancel_event
+
+    def _remaining(self) -> float:
+        return max(0.0, self._deadline - self._monotonic())
+
+    def _check_work(self) -> float:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise CodexRequestCancelled("Codex token refresh was cancelled.")
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise CodexRequestTimeout("Codex token refresh exceeded its deadline.")
+        return remaining
+
+    def _acquire_lock(self) -> FileLock:
+        """Acquire the auth lock in bounded, cancellation-aware slices."""
+        while True:
+            remaining = self._check_work()
+            lock = FileLock(str(self._lock_path))
+            try:
+                lock.acquire(timeout=min(0.1, remaining))
+            except Timeout:
+                continue
+            try:
+                self._check_work()
+            except BaseException:
+                lock.release()
+                raise
+            return lock
 
     def is_authenticated(self) -> bool:
         try:
@@ -103,8 +269,8 @@ class CodexTokenManager:
 
     def get_access_token(self) -> str:
         data = self._read()
-        expires_at = data.get("expires_at", 0)
-        if time.time() + REFRESH_BUFFER_SECONDS >= expires_at:
+        expires_at = data.get("expires_at")
+        if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool) or self._time() + REFRESH_BUFFER_SECONDS >= expires_at:
             self._refresh(data)
             data = self._read()
         return data["access_token"]
@@ -154,37 +320,47 @@ class CodexTokenManager:
         return data
 
     def _refresh(self, data: dict, *, rejected_access_token: str | None = None) -> None:
-        lock = FileLock(str(self._lock_path), timeout=30)
-        with lock:
+        self._check_work()
+        lock = self._acquire_lock()
+        try:
             self._cache = None
             self._cache_mtime = 0.0
             fresh = self._read()
-            expires_safely = fresh.get("expires_at", 0) > time.time() + REFRESH_BUFFER_SECONDS
+            expires_safely = fresh.get("expires_at", 0) > self._time() + REFRESH_BUFFER_SECONDS
             already_replaced = bool(
                 rejected_access_token and fresh.get("access_token") != rejected_access_token
             )
             if expires_safely and (rejected_access_token is None or already_replaced):
                 return
 
+            remaining = self._check_work()
+
             refresh_token = fresh.get("refresh_token") or data.get("refresh_token")
             if not refresh_token:
                 raise RuntimeError("No refresh_token available in auth file.")
 
-            response = httpx.post(
+            request_data = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CLIENT_ID,
+            }
+            response = request_json(
+                "POST",
                 TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": CLIENT_ID,
-                },
-                timeout=30,
+                transport=self._transport,
+                timeout_seconds=min(self._refresh_timeout, remaining),
+                deadline=self._deadline,
+                monotonic_fn=self._monotonic,
+                cancel_event=self._cancel_event,
+                data=request_data,
             )
+            self._check_work()
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (401, 403):
                     raise CodexAuthError(
-                        "Codex session expired. Re-run `codex-pool accounts login` to re-authenticate."
+                        "Codex session expired. Re-run `subspool codex account login` to re-authenticate."
                     ) from e
                 raise
             result = response.json()
@@ -193,7 +369,7 @@ class CodexTokenManager:
             if "refresh_token" in result:
                 fresh["refresh_token"] = result["refresh_token"]
             fresh["expires_at"] = result.get(
-                "expires_at", int(time.time()) + result.get("expires_in", 3600)
+                "expires_at", int(self._time()) + result.get("expires_in", 3600)
             )
 
             tmp_path = self._path.with_suffix(".json.tmp")
@@ -204,6 +380,8 @@ class CodexTokenManager:
 
             self._cache = None
             self._cache_mtime = 0.0
+        finally:
+            lock.release()
 
 
 def _structured_status_code(exc: BaseException) -> int | None:

@@ -30,7 +30,7 @@ from .hashing import config_hash as compute_config_hash
 from .hashing import extend_hash, rolling_hashes
 
 # Default number of most-recently-committed session records retained;
-# `codex-pool serve` overrides it from CODEX_POOL_MAX_SESSIONS at startup.
+# `subs-pool codex serve` overrides it from CODEX_POOL_MAX_SESSIONS at startup.
 DEFAULT_MAX_SESSIONS = 100000
 
 
@@ -106,6 +106,26 @@ class ChainStore:
         # Longest match wins; deterministic tie-break by chain_id.
         best = sorted(candidates, key=lambda r: (-r.length, r.chain_id))[0]
         return MatchResult(chain_id=best.chain_id, account_ref=best.account_ref, prefix_hashes=prefix_hashes)
+
+    def find_bound(self, input_items: list, cfg: dict) -> MatchResult:
+        """Find affinity without applying live eligibility.
+
+        Routing must learn that a continuation is bound even when its owner
+        is currently disabled, stale, or unauthenticated; otherwise it could
+        silently rewrite the conversation onto another account.
+        """
+        cfg_hash = compute_config_hash(cfg)
+        prefix_hashes = rolling_hashes(input_items)
+        with self._lock:
+            candidates = [
+                rec for rec in self._records.values()
+                if rec.config_hash == cfg_hash and rec.length <= len(input_items)
+                and prefix_hashes[rec.length] == rec.content_hash
+            ]
+            if not candidates:
+                return MatchResult(self._unused_id_locked(), None, prefix_hashes)
+            best = sorted(candidates, key=lambda r: (-r.length, r.chain_id))[0]
+            return MatchResult(best.chain_id, best.account_ref, prefix_hashes)
 
     def commit(
         self,

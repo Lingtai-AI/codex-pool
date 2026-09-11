@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Test source
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python -e ".[test]"
+          .venv/bin/python -m pytest
+      - name: Build wheel and sdist
+        run: uv build
+      - name: Validate distribution contents
+        run: .venv/bin/python tools/validate_distribution.py dist/*
+      - name: Smoke-test built wheel
+        run: |
+          wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          uv venv .artifact-venv
+          uv pip install --python .artifact-venv/bin/python "$wheel_path"
+          .artifact-venv/bin/python -c "import subs_pool; from importlib.metadata import version; assert subs_pool.__version__ == version('subs-pool')"
+          .artifact-venv/bin/subspool --version
+          .artifact-venv/bin/subspool-cli --version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: subs-pool-distributions
+          path: dist/*
+          if-no-files-found: error

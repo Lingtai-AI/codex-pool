@@ -1,4 +1,4 @@
-from codex_pool.hashing import config_hash, extend_hash, item_hash, rolling_hashes
+from subs_pool.modules.codex.hashing import config_hash, extend_hash, item_hash, rolling_hashes
 
 
 def test_rolling_hash_is_order_and_content_sensitive():

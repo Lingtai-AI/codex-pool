@@ -1,9 +1,10 @@
 """Read one Codex account's current quota from the read-only WHAM endpoint.
 
-The quota command reads the account's existing flat auth file and makes one
-direct ``GET https://chatgpt.com/backend-api/wham/usage`` request. It never
-refreshes or writes auth, starts a Codex subprocess, copies tokens to a
-temporary home, retries, or falls back to another account or transport.
+The quota command reads the account's existing flat auth file, uses Codex's
+existing file-locked token refresh owner only when the access token needs it,
+and makes one direct ``GET https://chatgpt.com/backend-api/wham/usage``
+request. It never starts a Codex subprocess, copies tokens to a temporary
+home, retries, or falls back to another account or transport.
 
 WHAM returns ``rate_limit`` (or ``rateLimits``) containing primary and
 secondary windows. Window percentages, reset timestamps, names, and actual
@@ -17,6 +18,8 @@ import base64
 import binascii
 import json
 import math
+import time
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from .auth_codex import CodexRequestCancelled, CodexRequestTimeout, CodexTokenManager, request_json
 
 _WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 _TIMEOUT_SECONDS = 10.0
@@ -53,6 +58,9 @@ class QuotaResult:
     secondary_window_name: str | None = None
     primary_window_duration_mins: float | None = None
     secondary_window_duration_mins: float | None = None
+    allowed: bool | None = None
+    limit_reached: bool | None = None
+    secondary_malformed: bool = False
 
     def __post_init__(self) -> None:
         if self.error is not None:
@@ -74,6 +82,8 @@ class QuotaResult:
         signal this reader knows. If all windows are unknown, preserve unknown
         rather than treating it as zero or exhausted.
         """
+        if self.limit_reached is not None:
+            return self.limit_reached
         values = [
             value
             for value in (self.primary_used_percent, self.secondary_used_percent)
@@ -111,6 +121,8 @@ class _Window:
     reset_at: str | None
     name: str | None
     duration_mins: float | None
+    present: bool = False
+    malformed: bool = False
 
 
 def _now_iso() -> str:
@@ -178,12 +190,59 @@ def _read_existing_auth(auth_path: Path) -> tuple[str, str | None]:
     return access_token, account_id
 
 
+def _quota_token(
+    path: Path,
+    *,
+    transport: httpx.BaseTransport | None,
+    timeout_seconds: float,
+    deadline: float,
+    monotonic_fn: Any,
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, str | None]:
+    """Return a usable token, sharing Codex's file-locked refresh owner.
+
+    Quota has one provider request budget.  A near-expiry token is refreshed
+    through the existing auth owner before that one WHAM request; WHAM is
+    never retried here.
+    """
+    access_token, account_id = _read_existing_auth(path)
+    if cancel_event is not None and cancel_event.is_set():
+        raise _Unavailable("request_timeout")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _Unavailable("auth_read_failed") from exc
+    refresh_token = raw.get("refresh_token") if isinstance(raw, Mapping) else None
+    if isinstance(refresh_token, str) and refresh_token:
+        try:
+            manager = CodexTokenManager(
+                str(path), transport=transport, time_fn=time.time,
+                refresh_timeout=max(0.1, timeout_seconds), deadline=deadline,
+                monotonic_fn=monotonic_fn,
+                cancel_event=cancel_event,
+            )
+            access_token = manager.get_access_token()
+            account_id = manager.get_account_id() or account_id
+            if cancel_event is not None and cancel_event.is_set():
+                raise _Unavailable("request_timeout")
+        except _Unavailable:
+            raise
+        except (CodexRequestCancelled, CodexRequestTimeout) as exc:
+            raise _Unavailable("request_timeout") from exc
+        except Exception as exc:  # auth provider boundary; do not expose details
+            raise _Unavailable("auth_refresh_failed") from exc
+    return access_token, account_id
+
+
 def _request_usage(
     access_token: str,
     account_id: str | None,
     *,
     timeout_seconds: float,
     transport: httpx.BaseTransport | None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    monotonic_fn: Any = time.monotonic,
 ) -> Mapping[str, Any]:
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -193,14 +252,28 @@ def _request_usage(
         headers["ChatGPT-Account-ID"] = account_id
 
     try:
-        with httpx.Client(
-            timeout=timeout_seconds,
+        if cancel_event is not None and cancel_event.is_set():
+            raise _Unavailable("request_timeout")
+        remaining = timeout_seconds if deadline is None else max(0.0, deadline - monotonic_fn())
+        if remaining <= 0:
+            raise _Unavailable("request_timeout")
+        response = request_json(
+            "GET",
+            _WHAM_USAGE_URL,
             transport=transport,
-            trust_env=False,
-            follow_redirects=False,
-        ) as client:
-            response = client.get(_WHAM_USAGE_URL, headers=headers)
+            timeout_seconds=remaining,
+            deadline=deadline,
+            monotonic_fn=monotonic_fn,
+            cancel_event=cancel_event,
+            headers=headers,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise _Unavailable("request_timeout")
+        if deadline is not None and monotonic_fn() >= deadline:
+            raise _Unavailable("request_timeout")
     except httpx.TimeoutException as exc:
+        raise _Unavailable("request_timeout") from exc
+    except (CodexRequestCancelled, CodexRequestTimeout) as exc:
         raise _Unavailable("request_timeout") from exc
     except httpx.HTTPError as exc:
         raise _Unavailable(f"request_failed:{type(exc).__name__}") from exc
@@ -262,24 +335,103 @@ def _reset_iso(value: Any) -> str | None:
         return None
 
 
-def _window(limit: Mapping[str, Any], kind: str) -> _Window:
-    raw = _variant(limit, f"{kind}_window", kind)
-    if not isinstance(raw, Mapping):
-        return _Window(None, None, None, None)
+def _aliased(
+    raw: Mapping[str, Any],
+    keys: tuple[str, ...],
+    normalizer: Any,
+) -> tuple[Any, bool, bool]:
+    """Normalize every supplied alias and detect invalid/conflicting values."""
+    values: list[Any] = []
+    malformed = False
+    for key in keys:
+        if key not in raw:
+            continue
+        value = raw[key]
+        normalized = normalizer(value)
+        if value is not None and normalized is None:
+            malformed = True
+        values.append(normalized)
+    present = bool(values)
+    if values and any(value != values[0] for value in values[1:]):
+        malformed = True
+    return (values[0] if values else None), present, malformed
 
-    name = _variant(raw, "window_name", "windowName")
+
+def _window_mapping(raw: Any, *, strict: bool) -> _Window:
+    if not isinstance(raw, Mapping):
+        return _Window(None, None, None, None, present=True, malformed=True)
+
+    name, name_present, name_malformed = _aliased(
+        raw, ("window_name", "windowName"), lambda value: value if isinstance(value, str) else None
+    )
+    malformed = strict and (not raw or name_malformed)
     if not isinstance(name, str):
         name = None
-    duration = _valid_duration(_variant(raw, "window_duration_mins", "windowDurationMins"))
-    if not any(key in raw for key in ("window_duration_mins", "windowDurationMins")):
-        seconds = _valid_duration(raw.get("limit_window_seconds"))
-        duration = seconds / 60.0 if seconds is not None else None
+
+    duration_mins, mins_present, mins_malformed = _aliased(
+        raw, ("window_duration_mins", "windowDurationMins"), _valid_duration
+    )
+    seconds, seconds_present, seconds_malformed = _aliased(
+        raw, ("limit_window_seconds",), _valid_duration
+    )
+    duration_present = mins_present or seconds_present
+    duration = duration_mins
+    if seconds_present:
+        seconds_duration = seconds / 60.0 if seconds is not None else None
+        if mins_present and duration != seconds_duration:
+            mins_malformed = True
+        if not mins_present:
+            duration = seconds_duration
+    if strict and duration_present and (mins_malformed or seconds_malformed):
+        malformed = True
+
+    raw_used, used_present, used_malformed = _aliased(
+        raw, ("used_percent", "usedPercent"), _valid_percent
+    )
+    if strict and (not used_present or raw_used is None or used_malformed):
+        malformed = True
+
+    reset_raw, reset_present, reset_malformed = _aliased(
+        raw, ("reset_at", "resetsAt"), _reset_iso
+    )
+    if strict and reset_present and reset_malformed:
+        malformed = True
     return _Window(
-        used_percent=_valid_percent(_variant(raw, "used_percent", "usedPercent")),
-        reset_at=_reset_iso(_variant(raw, "reset_at", "resetsAt")),
+        used_percent=_valid_percent(raw_used),
+        reset_at=reset_raw,
         name=name,
         duration_mins=duration,
+        present=True,
+        malformed=malformed or (not strict and raw_used is not None and _valid_percent(raw_used) is None),
     )
+
+
+def _window(limit: Mapping[str, Any], kind: str, *, strict: bool = False) -> _Window:
+    containers = [
+        limit[key]
+        for key in (f"{kind}_window", kind)
+        if key in limit
+    ]
+    if not containers:
+        return _Window(None, None, None, None)
+    if not strict or len(containers) == 1:
+        return _window_mapping(containers[0], strict=strict)
+
+    normalized = [_window_mapping(container, strict=True) for container in containers]
+    if any(window.malformed for window in normalized):
+        return _Window(None, None, None, None, present=True, malformed=True)
+    first = normalized[0]
+    if any(
+        (
+            window.used_percent != first.used_percent
+            or window.reset_at != first.reset_at
+            or window.name != first.name
+            or window.duration_mins != first.duration_mins
+        )
+        for window in normalized[1:]
+    ):
+        return _Window(None, None, None, None, present=True, malformed=True)
+    return first
 
 
 def _rate_limit(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -301,6 +453,10 @@ def read_quota(
     *,
     transport: httpx.BaseTransport | None = None,
     timeout_seconds: float = _TIMEOUT_SECONDS,
+    now_fn=_now_iso,
+    cancel_event: threading.Event | None = None,
+    monotonic_fn: Any = time.monotonic,
+    deadline: float | None = None,
 ) -> QuotaResult:
     """Read one account's current Codex OAuth rate-limit usage.
 
@@ -308,22 +464,44 @@ def read_quota(
     values, or the auth path in its errors. Every failure returns current
     ``status="unavailable"`` data with all quota facts unknown.
     """
-    observed_at = _now_iso()
+    deadline = deadline if deadline is not None else monotonic_fn() + max(0.0, timeout_seconds)
+    observed_at = now_fn()
     path = Path(auth_path).expanduser()
     if not path.is_file():
         return _unknown(observed_at, "auth_file_not_found")
 
     try:
-        access_token, account_id = _read_existing_auth(path)
+        access_token, account_id = _quota_token(
+            path,
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            monotonic_fn=monotonic_fn,
+            cancel_event=cancel_event,
+        )
+        # The freshness clock starts immediately before the provider request,
+        # rather than when a caller redraws a UI or opens the auth file.
+        observed_at = now_fn()
         payload = _request_usage(
             access_token,
             account_id,
             timeout_seconds=timeout_seconds,
             transport=transport,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            monotonic_fn=monotonic_fn,
         )
         limit = _rate_limit(payload)
         primary = _window(limit, "primary")
-        secondary = _window(limit, "secondary")
+        secondary = _window(limit, "secondary", strict=True)
+        if secondary.malformed:
+            return _unknown(observed_at, "quota_fields_malformed")
+        allowed = _variant(limit, "allowed", "is_allowed")
+        limit_reached = _variant(limit, "limit_reached", "limitReached")
+        if not isinstance(allowed, bool):
+            allowed = None
+        if not isinstance(limit_reached, bool):
+            limit_reached = None
     except _Unavailable as exc:
         return _unknown(observed_at, str(exc))
     except Exception as exc:  # noqa: BLE001 - fail-soft boundary; never raise
@@ -340,4 +518,7 @@ def read_quota(
         secondary_window_name=secondary.name,
         primary_window_duration_mins=primary.duration_mins,
         secondary_window_duration_mins=secondary.duration_mins,
+        allowed=allowed,
+        limit_reached=limit_reached,
+        secondary_malformed=secondary.malformed,
     )

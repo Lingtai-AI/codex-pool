@@ -1,13 +1,15 @@
 import asyncio
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 
-from codex_pool.accounts import AccountStore
-from codex_pool.chain import ChainStore
-from codex_pool.server import create_app, _extract_config, _with_encrypted_reasoning_include
+from subs_pool.modules.codex.accounts import AccountStore
+from subs_pool.modules.codex.chain import ChainStore
+from subs_pool.modules.codex.server import create_app, _extract_config, _with_encrypted_reasoning_include
+from subs_pool.modules.codex.quota_store import QuotaStore, iso
 from fakes import ScriptedUpstream, write_auth_fixture
 
 API_KEY = "test-key-do-not-log"
@@ -22,7 +24,20 @@ def _setup_one_account(tmp_path):
     auth = tmp_path / "personal.json"
     write_auth_fixture(auth)
     store = AccountStore()
-    store.import_account("personal", str(auth))
+    account = store.import_account("personal", str(auth))
+    now = datetime.now(timezone.utc)
+    quota = QuotaStore(store.root)
+    quota.claim([account], attempt_id="test-fixture", owner_id="test", deadline_at=now + timedelta(seconds=20))
+    assert quota.commit_success(
+        account,
+        attempt_id="test-fixture",
+        sample={
+            "source_at": iso(now), "checked_at": iso(now), "fresh_until": iso(now + timedelta(seconds=60)),
+            "allowed": True, "limit_reached": False,
+            "primary": {"used_percent": 10, "remaining_percent": 90, "reset_at": None, "window_seconds": None},
+            "secondary": {"used_percent": None, "remaining_percent": None, "reset_at": None, "window_seconds": None},
+        },
+    )
     return store
 
 
@@ -559,7 +574,7 @@ async def test_slow_token_refresh_does_not_serialize_concurrent_requests(tmp_pat
         time.sleep(0.3)
         return "at-1"
 
-    monkeypatch.setattr("codex_pool.server.CodexTokenManager.get_access_token", slow_get_access_token)
+    monkeypatch.setattr("subs_pool.modules.codex.server.CodexTokenManager.get_access_token", slow_get_access_token)
 
     async def make_request():
         async with _client(app) as client:

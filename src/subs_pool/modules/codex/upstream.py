@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from . import __version__
+from subs_pool import __version__
 from .errors import UpstreamTransportError
 from .sse import decode_sse_stream
 

@@ -1,138 +1,72 @@
-# codex-pool CLI ↔ frontend contract (frozen)
+# CLI contract
 
-This is the exact command/JSON surface driven by the Textual frontend. It is
-not a new SDK. Invocation is `[sys.executable, "-m", "codex_pool", ...]` or
-the installed `codex-pool` entry point. Machine-facing commands accept
-`--json`; JSON output is one object (or one JSON-Lines stream for device login)
-and is never mixed with human-readable output on the same stream.
+The installed commands are exactly `subspool` and `subspool-cli`.
 
-## Global JSON error shape
+Human commands:
 
-An ordinary `--json` command failure exits nonzero, leaves stdout empty, and
-writes exactly one line to stderr:
-
-```json
-{"error":"<human-readable, nonsecret message>"}
+```text
+subspool                         # open Codex TUI
+subspool --help
+subspool --version
+subspool modules [list]
+subspool codex account import ID --path AUTH.json [--weight N]
+subspool codex account list
+subspool codex account login ID --device
+subspool codex account enable ID
+subspool codex account disable ID
+subspool codex account weight ID N
+subspool codex status
+subspool codex quota
+subspool codex serve [--listen 127.0.0.1:8765] [--api-key KEY]
 ```
 
-Argparse-level errors honor `--json` as well. Credential/token values,
-provider response bodies, and auth-file contents never appear in output or
-errors.
+The account import operation references an existing auth file; it does not
+copy credentials. Device login remains human-only. There are no logout,
+remove, service, provider-discovery, or plugin commands. `--listen` remains
+the baseline loopback grammar and remote binds are rejected.
 
-## Account and pool commands
+The Agent command is machine-only. It never invokes the TUI or a prompt:
 
-- `accounts import REF --path PATH [--weight N] --json` imports an explicit,
-  user-provided local auth-file path and prints one account status object.
-- `accounts list --json` prints `{"accounts":[<status>...]}`.
-- `accounts login REF --device --json` runs device-code OAuth in this CLI
-  process and streams JSONL events. `--weight N` may set the weight of a new
-  ref and is ignored when re-login updates an existing ref.
-- `pool enable REF --json`, `pool disable REF --json`, and
-  `pool weight REF N --json` print one account status object.
-
-The shared status object is exactly:
-
-```json
-{"ref":"example","enabled":true,"weight":1,"auth_present":true,"quota":"unknown"}
+```text
+subspool-cli [--help|--version]
+subspool-cli modules [list]
+subspool-cli codex account list
+subspool-cli codex account import ID --path AUTH.json [--weight N]
+subspool-cli codex account enable|disable ID
+subspool-cli codex account weight ID N
+subspool-cli codex status
+subspool-cli codex quota
 ```
 
-It never carries live quota readings or auth contents. Re-login preserves the
-existing ref's enabled/weight state and resets any stale internal quota
-observation.
-
-## Device-code login
-
-Only `--device` login is implemented. Omitting it is a nonzero JSON error that
-names the unsupported browser OAuth gap. The flow uses the real device-code
-endpoints/client id/poll rules adapted from the shipping LingTai TUI source;
-there is no invented fallback:
-
-1. `{"event":"authorization_required","verification_uri":"https://auth.openai.com/codex/device","user_code":"ABCD-1234","expires_in":900,"interval":5}`
-2. `{"event":"completed","account":<status>}` on success.
-
-The CLI flushes each event. A failure exits nonzero with one nonsecret JSON
-error on stderr, even if event 1 was already printed. No access token, refresh
-token, id token, code verifier, or raw provider response is emitted.
-Polling remains inside this process, never in the TUI.
-
-The browser PKCE flow in the source (`local HTTP listener`, system browser,
-and callback on a local port) is intentionally unsupported in this one-shot
-headless CLI. The command reports that gap instead of silently inventing a
-flow.
-
-## Status and quota
-
-- `status --json` prints `{"accounts":[<status with authenticated>...],"eligible_count":N}`.
-  `eligible_count` counts enabled, authenticated accounts that are not known
-  exhausted. Unknown quota remains eligible; no liveness claim is included.
-- `quota --json` reads each imported account with one direct read-only
-  `GET https://chatgpt.com/backend-api/wham/usage` and prints:
+Agent `codex account login`, `codex serve`, `tui`, unsupported commands, and
+bad syntax return a structured error. Every ordinary completion is one UTF-8
+JSON object and newline:
 
 ```json
-{"accounts":[{"ref":"example","quota":{
-  "primary_used_percent":30,
-  "secondary_used_percent":null,
-  "primary_reset_at":"2026-09-10T05:00:00+00:00",
-  "secondary_reset_at":null,
-  "observed_at":"2026-09-10T04:55:00+00:00",
-  "status":"ok",
-  "primary_remaining_percent":70,
-  "secondary_remaining_percent":null,
-  "primary_window_name":"burst",
-  "secondary_window_name":null,
-  "primary_window_duration_mins":300,
-  "secondary_window_duration_mins":null
-}}]}
+{"schema_version":1,"command":"codex.quota","ok":true,"data":{},"error":null}
 ```
 
-Actual `limit_window_seconds` is converted to minutes when provider minute fields are absent; no window length is assumed.
+Failures use `ok:false` and an error object with `code`, `message`, and
+`details`. Exit codes are `0` success, `2` syntax/unsupported, `3`
+quota/auth/network unavailable or incomplete, `4` local state/configuration,
+`5` unexpected internal failure, and `130` handled interruption. A successful
+quota check may report exhausted accounts with exit `0`; a failed required
+refresh exits `3` and includes the readable partial shared snapshot.
 
-The reader uses the existing flat access token and, when present, account ID
-from the imported auth file. It does not refresh or modify that file, perform
-login, retry, follow redirects, use another account, fall back to a subprocess,
-or materialize tokens in a temporary home.
+`account list` is metadata-only: it reports account ID, enabled/weight, local
+auth presence/state, never quota percentages or a quota
+derived ready flag. `codex quota` always requests a current pool-wide refresh
+and returns module, resolved root, generated time, committed revision,
+refresh outcome, account rows, current quota, explicitly historical
+`last_success`, freshness/age, eligibility, and exclusion reason.
 
-WHAM's `rate_limit` / `rateLimits` payload supplies `primary_window` and
-`secondary_window` (with the source-backed `primary` / `secondary` structural
-variant). Used percentage accepts the source's snake/camel spellings, must be
-finite and in `0..100`, and preserves a real zero. Remaining is
-`max(0, 100 - used)` only when used is valid; it is not aggregate account
-balance. Reset timestamps are normalized from finite nonnegative Unix seconds
-to UTC ISO-8601. Window name and duration preserve only actual returned facts;
-the CLI never invents a 5-hour, weekly, or other label/default.
+The TUI enters `CHECKING` before current values are shown. `u` forces a shared
+refresh, `r` reloads metadata and performs the same refresh, and a one-second
+inspection loop observes shared state and requests the 30-second background
+target. Historical samples are labeled stale/last-success and are never
+rendered as current green values.
 
-A successful response containing a rate-limit object has `status:"ok"`; an
-empty window remains successful with unknown (`null`) facts. HTTP failures
-(including 429/unauthenticated responses), transport errors, invalid JSON, and
-missing/malformed quota objects have `status:"unavailable"`, keep every quota
-fact null (never zero), and add a short nonsecret `error` reason. A failure for
-one account does not fail other accounts. `observed_at` is always a real UTC
-ISO-8601 timestamp, including for unavailable results.
-
-A reading proving primary or secondary usage is 100% is stored as the
-package's small quota observation and makes that account ineligible until a
-later read proves it non-exhausted or unknown. Unknown/failure clears the
-observation and remains eligible.
-
-## Local server and TUI
-
-- `serve --listen 127.0.0.1:8765 [--api-key KEY | $CODEX_POOL_API_KEY] --json`
-  runs uvicorn in the foreground. The host must be `127.0.0.1`, `localhost`,
-  or `::1`; remote listening is not supported. Port must be an integer in
-  `1..65535`. A missing key is a nonzero JSON error, and the key is never
-  echoed. `CODEX_POOL_MAX_SESSIONS` (default `100000`) is read once at startup
-  as the number of retained in-memory session records (see `CONTRACT.md`);
-  a set value that is not a positive integer is a nonzero error (the global
-  JSON error shape under `--json`) and the server does not start. `serve` is
-  a user-launched, user-supervised foreground process; no command here
-  installs, daemonizes, autostarts, or stops it.
-- `tui` and no subcommand dispatch to `codex_pool.tui.run_tui()`.
-  The Textual frontend is a thin CLI subprocess client: it renders returned
-  facts and sends import/login/pool/quota actions through the frozen surface.
-  It never reads auth/token files or performs provider calls. The table derives
-  primary/secondary remaining meters only from validated used percentages;
-  the detail pane renders the existing flat reset/observation fields and the
-  additive flat window names/durations. `u` explicitly checks all accounts and
-  clears their old presentation while loading; `r` refreshes metadata only and
-  preserves ref-keyed quota presentation. Selection, resize, and render never
-  trigger a quota command, and no timer or automatic retry exists.
+Account references are any non-empty path-safe string: `/`, `\`, `.`, and `..`
+are rejected, with no additional ASCII or length restriction. Agent parsing
+consumes the complete token list; unknown, duplicate, or trailing options are
+syntax errors and all help paths are state-free JSON responses.

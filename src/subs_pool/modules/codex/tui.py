@@ -1,9 +1,8 @@
-"""Textual TUI — a pure frontend over the codex-pool CLI JSON contract.
+"""Textual TUI — a pure frontend over a selected module's CLI contract.
 
 No account/token storage, auth, or provider HTTP happens in this module:
-every action runs a :class:`codex_pool.cli_client.CLIClient` command (a local
-subprocess running ``python -m codex_pool ...``) and renders returned JSON
-facts.
+the shell delegates machine-safe operations to the selected module and renders
+returned JSON facts.
 """
 
 from __future__ import annotations
@@ -16,7 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .cli_client import CLIClient, CLIError, LoginStream
+from ...cli_client import CLIClient, CLIError, LoginStream
+from ...registry import DEFAULT_MODULE_ID, ModuleDescriptor, get_module
 
 
 @dataclass
@@ -28,6 +28,8 @@ class _QuotaView:
 
 
 def _clean_error(value: Any, fallback: str = "quota unavailable") -> str:
+    if isinstance(value, Mapping):
+        value = value.get("message")
     if not isinstance(value, str) or not value.strip():
         return fallback
     one_line = " ".join(value.split())
@@ -52,7 +54,7 @@ def _quota_view(value: Any, attempted_at: str) -> _QuotaView:
         )
     snapshot = dict(value)
     backend_status = snapshot.get("status")
-    if "error" in snapshot or backend_status not in (None, "ok"):
+    if snapshot.get("error") is not None or backend_status not in (None, "ok"):
         reason = snapshot.get("error")
         if reason is None and backend_status is not None:
             reason = f"quota status {backend_status}"
@@ -65,13 +67,35 @@ def _quota_view(value: Any, attempted_at: str) -> _QuotaView:
 
     primary = _remaining_from_used(snapshot.get("primary_used_percent"))
     secondary = _remaining_from_used(snapshot.get("secondary_used_percent"))
-    if primary is not None and secondary is not None:
+    if primary is not None:
         state = "ok"
-    elif primary is not None or secondary is not None:
+    elif secondary is not None:
         state = "partial"
     else:
         state = "empty"
     return _QuotaView(state=state, snapshot=snapshot, attempted_at=attempted_at)
+
+
+def _sidecar_sample_view(sample: Any, attempted_at: str | None, *, state: str = "ok", error: Any = None) -> _QuotaView:
+    """Adapt a Codex sidecar sample to the table's display model."""
+    if not isinstance(sample, Mapping):
+        return _QuotaView(state=state, attempted_at=attempted_at, error=_clean_error(error) if error else None)
+    primary = sample.get("primary") if isinstance(sample.get("primary"), Mapping) else {}
+    secondary = sample.get("secondary") if isinstance(sample.get("secondary"), Mapping) else {}
+    flat = {
+        "primary_used_percent": primary.get("used_percent"),
+        "secondary_used_percent": secondary.get("used_percent"),
+        "primary_reset_at": primary.get("reset_at"),
+        "secondary_reset_at": secondary.get("reset_at"),
+        "primary_window_duration_mins": (primary.get("window_seconds") / 60.0 if isinstance(primary.get("window_seconds"), (int, float)) else None),
+        "secondary_window_duration_mins": (secondary.get("window_seconds") / 60.0 if isinstance(secondary.get("window_seconds"), (int, float)) else None),
+        "observed_at": sample.get("source_at"),
+        "status": "ok" if state in {"ok", "exhausted"} else state,
+    }
+    view = _quota_view(flat, attempted_at or str(sample.get("checked_at") or ""))
+    view.state = state
+    view.error = _clean_error(error) if error else view.error
+    return view
 
 
 def _format_percent(value: float) -> str:
@@ -150,8 +174,8 @@ def _format_duration(value: Any) -> str:
 
 def _missing_textual_error() -> str:
     return (
-        "the codex-pool TUI requires the 'textual' package "
-        "(it is a mandatory dependency of codex-pool; reinstall codex-pool "
+        "the subs-pool TUI requires the 'textual' package "
+        "(it is a mandatory dependency of subs-pool; reinstall subs-pool "
         "if this is missing)"
     )
 
@@ -341,10 +365,10 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 self._background_cancel(self._stream)
 
 
-    class CodexPoolApp(App[None]):
+    class SubscriptionPoolApp(App[None]):
         """Main accounts/status view with pool and auth actions."""
 
-        TITLE = "Codex Pool / Accounts"
+        TITLE = "subs-pool"
 
         CSS = """
         #import-dialog, #login-dialog, #weight-dialog {
@@ -410,15 +434,28 @@ if _TEXTUAL_IMPORT_ERROR is None:
             Binding("r", "refresh", "Refresh"),
         ]
 
-        def __init__(self, client: CLIClient | None = None) -> None:
+        def __init__(
+            self,
+            module: ModuleDescriptor | None = None,
+            client: CLIClient | None = None,
+        ) -> None:
             super().__init__()
-            self._client = client or CLIClient()
+            self._module = module or get_module(DEFAULT_MODULE_ID)
+            self.title = f"subs-pool — {self._module.display_name} Accounts"
+            if client is not None:
+                self._client = client
+            elif self._module.id == "codex":
+                from .tui_adapter import CodexTUIAdapter
+                self._client = CodexTUIAdapter()
+            else:
+                self._client = CLIClient(self._module.id)
             self._accounts: list[dict[str, Any]] = []
             self._quota_by_ref: dict[str, _QuotaView] = {}
             self._selected_ref: str | None = None
             self._eligible_count = 0
             self._quota_running = False
             self._status_source: str | None = None
+            self._last_quota_refresh = 0.0
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -445,7 +482,60 @@ if _TEXTUAL_IMPORT_ERROR is None:
             table.add_column("S REMAINING", key="secondary")
             table.add_column("CHECK", key="check")
             table.focus()
+            self.set_interval(1.0, self._quota_tick)
+            self.set_interval(1.0, self._inspect_shared_state)
             self.action_refresh()
+
+        def _quota_tick(self) -> None:
+            """Inspect the shared view and request the 30-second target."""
+            if self._quota_running or not self._accounts:
+                return
+            if asyncio.get_running_loop().time() - self._last_quota_refresh >= 30.0:
+                self.action_refresh_quota()
+
+        @work(exclusive=True, group="observe")
+        async def _inspect_shared_state(self) -> None:
+            if self._quota_running or not self._accounts:
+                return
+            try:
+                data = await self._client.status()
+            except CLIError as exc:
+                for ref in self._quota_by_ref:
+                    self._quota_by_ref[ref] = _QuotaView(state="unavailable", error=_clean_error(exc.message, "state unavailable"))
+                if self.is_mounted:
+                    self._render_quota_rows()
+                    self._render_detail()
+                    self._render_quota_summary()
+                return
+            rows = data.get("accounts") if isinstance(data, Mapping) else None
+            if not isinstance(rows, list):
+                return
+            by_ref = {row.get("ref"): row for row in rows if isinstance(row, Mapping) and isinstance(row.get("ref"), str)}
+            for ref in set(self._quota_by_ref) - set(by_ref):
+                # A successful observation that omits a previously displayed
+                # account must not leave its old green values on screen.
+                self._quota_by_ref[ref] = _QuotaView(state="unavailable", error="account state changed")
+            for ref, row in by_ref.items():
+                freshness = row.get("freshness")
+                if freshness == "checking" and row.get("enabled") and row.get("authenticated"):
+                    self._quota_by_ref[ref] = _QuotaView(state="checking", attempted_at=row.get("attempted_at"))
+                elif freshness == "stale":
+                    self._quota_by_ref[ref] = _sidecar_sample_view(row.get("last_success"), row.get("attempted_at"), state="stale")
+                elif freshness == "failed":
+                    self._quota_by_ref[ref] = _sidecar_sample_view(None, row.get("attempted_at"), state="unavailable", error=row.get("error"))
+                elif freshness == "fresh" and row.get("eligible"):
+                    self._quota_by_ref[ref] = _sidecar_sample_view(row.get("current"), row.get("attempted_at"), state="ok", error=row.get("error"))
+                elif freshness == "fresh":
+                    if row.get("exclusion_reason") == "exhausted" and isinstance(row.get("current"), Mapping):
+                        self._quota_by_ref[ref] = _sidecar_sample_view(row.get("current"), row.get("attempted_at"), state="exhausted", error=row.get("error"))
+                    else:
+                        self._quota_by_ref[ref] = _sidecar_sample_view(None, row.get("attempted_at"), state="unavailable", error=row.get("exclusion_reason") or row.get("error"))
+                else:
+                    self._quota_by_ref[ref] = _sidecar_sample_view(None, row.get("attempted_at"), state="unavailable", error=row.get("exclusion_reason") or row.get("error"))
+            if self.is_mounted:
+                self._render_quota_rows()
+                self._render_detail()
+                self._render_quota_summary()
 
         def _set_status(
             self,
@@ -487,7 +577,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             return "Y" if value else "N"
 
         def _remaining(self, view: _QuotaView, kind: str) -> float | None:
-            if view.state not in {"ok", "partial", "empty"} or view.snapshot is None:
+            if view.state not in {"ok", "partial", "empty", "exhausted"} or view.snapshot is None:
                 return None
             return _remaining_from_used(view.snapshot.get(f"{kind}_used_percent"))
 
@@ -519,8 +609,6 @@ if _TEXTUAL_IMPORT_ERROR is None:
             *,
             say_remaining: bool = False,
         ) -> Text:
-            if view.state == "checking":
-                return Text("…", style="bold dim")
             return self._meter(
                 self._remaining(view, kind),
                 width,
@@ -538,11 +626,15 @@ if _TEXTUAL_IMPORT_ERROR is None:
             observed = self._observed(view, seconds=False)
             suffix = f" {observed}" if observed != "N/A" else ""
             if view.state == "not_checked":
-                return Text("NOT CHECKED", style="dim")
+                return Text("CHECKING", style="bold yellow")
             if view.state == "checking":
                 return Text("CHECKING", style="bold yellow")
             if view.state == "ok":
                 return Text(f"OK{suffix}", style="bright_green")
+            if view.state == "exhausted":
+                return Text(f"EXHAUSTED{suffix}", style="bright_red")
+            if view.state == "stale":
+                return Text("STALE", style="bright_yellow")
             if view.state == "partial":
                 return Text(f"PARTIAL{suffix}", style="bright_yellow")
             if view.state == "empty":
@@ -614,7 +706,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 table.update_cell(ref, "check", self._check_cell(view), update_width=True)
 
         def _window_detail(self, detail: Text, view: _QuotaView, kind: str) -> None:
-            snapshot = view.snapshot if view.state in {"ok", "partial", "empty"} else None
+            snapshot = view.snapshot if view.state in {"ok", "partial", "empty", "exhausted"} else None
             title = kind.capitalize()
             if snapshot is not None:
                 name = snapshot.get(f"{kind}_window_name")
@@ -642,11 +734,15 @@ if _TEXTUAL_IMPORT_ERROR is None:
 
         def _detail_check(self, view: _QuotaView) -> tuple[str, str]:
             if view.state == "not_checked":
-                return "NOT CHECKED", "Quota not checked. Press u."
+                return "CHECKING", "Checking quota…"
             if view.state == "checking":
                 return "CHECKING", "Checking quota…"
             if view.state == "ok":
                 return "OK", ""
+            if view.state == "exhausted":
+                return "EXHAUSTED", "The current quota window is exhausted."
+            if view.state == "stale":
+                return "STALE", "The last successful check is historical."
             if view.state == "partial":
                 return "PARTIAL", "One window was not provided."
             if view.state == "empty":
@@ -693,11 +789,15 @@ if _TEXTUAL_IMPORT_ERROR is None:
             pane.update(detail)
 
         def _render_quota_summary(self) -> None:
-            counts = {state: 0 for state in ("ok", "unavailable", "not_checked", "checking")}
+            counts = {state: 0 for state in ("ok", "unavailable", "not_checked", "checking", "stale", "exhausted")}
             for ref in (str(account["ref"]) for account in self._accounts):
                 state = self._quota_by_ref.get(ref, _QuotaView()).state
                 if state in {"ok", "partial", "empty"}:
                     counts["ok"] += 1
+                elif state == "exhausted":
+                    counts["exhausted"] += 1
+                elif state == "stale":
+                    counts["stale"] += 1
                 elif state in {"unavailable", "interrupted"}:
                     counts["unavailable"] += 1
                 elif state == "checking":
@@ -707,7 +807,9 @@ if _TEXTUAL_IMPORT_ERROR is None:
             parts = [
                 f"Quota: {counts['ok']} OK",
                 f"{counts['unavailable']} unavailable",
-                f"{counts['not_checked']} not checked",
+                f"{counts['exhausted']} exhausted",
+                f"{counts['stale']} stale",
+                f"{counts['not_checked']} pending",
             ]
             if counts["checking"]:
                 parts.append(f"{counts['checking']} checking")
@@ -786,9 +888,18 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     "No accounts — i Import / l Login"
                     if not accounts
                     else f"{len(accounts)} account(s), {self._eligible_count} eligible; "
-                    "r refreshes accounts only, u checks quota for all"
+                    "r reloads accounts and checks quota, u forces quota check"
                 )
                 self._set_status(message, source="metadata")
+            for account in accounts:
+                ref = str(account["ref"])
+                if not (account.get("enabled") and account.get("authenticated")):
+                    self._quota_by_ref[ref] = _QuotaView(
+                        state="unavailable", error=str(account.get("exclusion_reason") or "unavailable")
+                    )
+            # Startup and metadata reload both enter the explicit CHECKING
+            # state before showing any current values for checkable accounts.
+            self.action_refresh_quota()
 
         def action_refresh_quota(self) -> None:
             if self._quota_running:
@@ -801,10 +912,13 @@ if _TEXTUAL_IMPORT_ERROR is None:
 
             attempted_at = datetime.now().astimezone().isoformat()
             self._quota_running = True
+            self._last_quota_refresh = asyncio.get_running_loop().time()
             for ref in requested_refs:
+                account = next((item for item in self._accounts if item.get("ref") == ref), {})
                 self._quota_by_ref[ref] = _QuotaView(
-                    state="checking",
+                    state="checking" if account.get("enabled") and account.get("authenticated") else "unavailable",
                     attempted_at=attempted_at,
+                    error=None if account.get("enabled") and account.get("authenticated") else str(account.get("exclusion_reason") or "unavailable"),
                 )
             self._render_quota_rows(requested_refs)
             self._render_detail()
@@ -825,22 +939,19 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 data = await self._client.quota()
             except CLIError as exc:
                 reason = _clean_error(exc.message)
-                for ref in requested_refs:
-                    if ref in self._quota_by_ref:
-                        self._quota_by_ref[ref] = _QuotaView(
-                            state="unavailable",
-                            attempted_at=attempted_at,
-                            error=reason,
-                        )
-                self._render_quota_rows(requested_refs)
-                self._render_detail()
-                self._render_quota_summary()
-                self._set_status(
-                    f"Quota check unavailable: {reason}",
-                    error=True,
-                    source="quota",
-                )
-                return
+                if isinstance(exc.data, dict):
+                    data = exc.data
+                    partial_error = reason
+                else:
+                    for ref in requested_refs:
+                        if ref in self._quota_by_ref:
+                            self._quota_by_ref[ref] = _QuotaView(state="unavailable", attempted_at=attempted_at, error=reason)
+                    if self.is_mounted:
+                        self._render_quota_rows(requested_refs)
+                        self._render_detail()
+                        self._render_quota_summary()
+                        self._set_status(f"Quota check unavailable: {reason}", error=True, source="quota")
+                    return
             except asyncio.CancelledError:
                 for ref in requested_refs:
                     current = self._quota_by_ref.get(ref)
@@ -850,15 +961,9 @@ if _TEXTUAL_IMPORT_ERROR is None:
                             attempted_at=attempted_at,
                             error="Quota check was interrupted.",
                         )
-                if self.is_mounted:
-                    self._render_quota_rows(requested_refs)
-                    self._render_detail()
-                    self._render_quota_summary()
-                    self._set_status(
-                        "Quota check interrupted",
-                        error=True,
-                        source="quota",
-                    )
+                # Textual cancels workers while tearing down the widget tree.
+                # Preserve the interrupted state for any later normal render,
+                # but never query widgets from the cancellation path.
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the TUI fail-soft
                 reason = f"unexpected {type(exc).__name__}"
@@ -869,24 +974,47 @@ if _TEXTUAL_IMPORT_ERROR is None:
                             attempted_at=attempted_at,
                             error=reason,
                         )
-                self._render_quota_rows(requested_refs)
-                self._render_detail()
-                self._render_quota_summary()
-                self._set_status(
-                    f"Quota check unavailable: {reason}",
-                    error=True,
-                    source="quota",
-                )
+                if self.is_mounted:
+                    self._render_quota_rows(requested_refs)
+                    self._render_detail()
+                    self._render_quota_summary()
+                    self._set_status(
+                        f"Quota check unavailable: {reason}",
+                        error=True,
+                        source="quota",
+                    )
                 return
             finally:
                 self._quota_running = False
 
+            partial_error = locals().get("partial_error")
             raw_entries = data.get("accounts") if isinstance(data, dict) else None
             entries: dict[str, Any] = {}
             if isinstance(raw_entries, list):
                 for entry in raw_entries:
                     if isinstance(entry, Mapping) and isinstance(entry.get("ref"), str):
-                        entries[entry["ref"]] = entry.get("quota")
+                        current = entry.get("current")
+                        if isinstance(current, Mapping):
+                            primary = current.get("primary") if isinstance(current.get("primary"), Mapping) else {}
+                            secondary = current.get("secondary") if isinstance(current.get("secondary"), Mapping) else {}
+                            entries[entry["ref"]] = {
+                                "primary_used_percent": primary.get("used_percent"),
+                                "secondary_used_percent": secondary.get("used_percent"),
+                                "primary_reset_at": primary.get("reset_at"),
+                                "secondary_reset_at": secondary.get("reset_at"),
+                                "primary_window_duration_mins": (primary.get("window_seconds") / 60.0 if isinstance(primary.get("window_seconds"), (int, float)) else None),
+                                "secondary_window_duration_mins": (secondary.get("window_seconds") / 60.0 if isinstance(secondary.get("window_seconds"), (int, float)) else None),
+                                "observed_at": current.get("source_at"),
+                                "status": "ok",
+                                "error": None,
+                                "_exhausted": entry.get("exclusion_reason") == "exhausted",
+                            }
+                        elif entry.get("freshness") == "stale":
+                            entries[entry["ref"]] = {"status": "stale", "error": "last successful check is stale"}
+                        elif entry.get("error") is not None or entry.get("exclusion_reason") is not None:
+                            entries[entry["ref"]] = {"status": "unavailable", "error": entry.get("error") or entry.get("exclusion_reason")}
+                        else:
+                            entries[entry["ref"]] = {"status": entry.get("freshness", "never"), "error": entry.get("exclusion_reason")}
 
             for ref in requested_refs:
                 if ref not in self._quota_by_ref:
@@ -898,22 +1026,29 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         error="quota result missing",
                     )
                 else:
-                    self._quota_by_ref[ref] = _quota_view(entries[ref], attempted_at)
+                    entry = entries[ref]
+                    view = _quota_view(entry, attempted_at)
+                    if isinstance(entry, Mapping) and entry.get("_exhausted"):
+                        view.state = "exhausted"
+                    if isinstance(entry, Mapping) and entry.get("status") == "stale":
+                        view.state = "stale"
+                    self._quota_by_ref[ref] = view
 
-            self._render_quota_rows(requested_refs)
-            self._render_detail()
-            self._render_quota_summary()
-            current_refs = [ref for ref in requested_refs if ref in self._quota_by_ref]
-            unavailable = sum(
-                self._quota_by_ref[ref].state in {"unavailable", "interrupted"}
-                for ref in current_refs
-            )
-            self._set_status(
-                f"Quota check complete: {len(current_refs) - unavailable} current, "
-                f"{unavailable} unavailable",
-                error=bool(unavailable),
-                source="quota",
-            )
+            if self.is_mounted:
+                self._render_quota_rows(requested_refs)
+                self._render_detail()
+                self._render_quota_summary()
+                current_refs = [ref for ref in requested_refs if ref in self._quota_by_ref]
+                unavailable = sum(
+                    self._quota_by_ref[ref].state in {"unavailable", "interrupted"}
+                    for ref in current_refs
+                )
+                self._set_status(
+                    f"Quota check complete: {len(current_refs) - unavailable} current, "
+                    f"{unavailable} unavailable",
+                    error=bool(unavailable) or bool(partial_error),
+                    source="quota",
+                )
 
         def action_import_account(self) -> None:
             def handle(result: tuple[str, str, int] | None) -> None:
@@ -993,12 +1128,16 @@ if _TEXTUAL_IMPORT_ERROR is None:
             await self._load_accounts()
 
 
-def run_tui(client: CLIClient | None = None) -> None:
-    """Entry point for ``codex-pool tui`` and bare ``codex-pool``."""
+def run_tui(
+    module_id: str = DEFAULT_MODULE_ID,
+    client: CLIClient | None = None,
+) -> None:
+    """Run the shared account frontend for one explicit built-in module."""
     if _TEXTUAL_IMPORT_ERROR is not None:
         print(f"error: {_missing_textual_error()}", file=sys.stderr)
         raise SystemExit(1)
-    CodexPoolApp(client=client).run()
+    module = get_module(module_id)
+    SubscriptionPoolApp(module=module, client=client).run()
 
 
-__all__ = ["run_tui"]
+__all__ = ["SubscriptionPoolApp", "run_tui"]
