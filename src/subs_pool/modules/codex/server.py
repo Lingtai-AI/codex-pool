@@ -10,7 +10,9 @@ session identity: the matched (or freshly issued) chain id.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
+from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
 from starlette.applications import Starlette
@@ -19,11 +21,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from .accounts import AccountStore
+from .accounts import AccountError, AccountStore
 from .auth_codex import CodexTokenManager
 from .chain import ChainStore
 from .errors import PoolRequestError, UpstreamTransportError
 from .routing import NoEligibleAccountError, select_account
+from .quota_refresh import QuotaRefreshCoordinator, refresh_async
+from .quota_store import QuotaStateError, QuotaStore, sanitized_error
 from .sse import encode_event
 from .upstream import Upstream
 
@@ -96,10 +100,10 @@ def _validate_request(body: object) -> None:
         raise PoolRequestError("'include' must be a string, an array, or null")
     for field, reason in _REJECTED_ALWAYS.items():
         if field in body:
-            raise PoolRequestError(f"'{field}' is not supported by codex-pool: {reason}")
+            raise PoolRequestError(f"'{field}' is not supported by the subs-pool Codex module: {reason}")
     for field, reason in _REJECTED_UNLESS_FALSE.items():
         if field in body and body[field] is not False:
-            raise PoolRequestError(f"'{field}' is not supported by codex-pool except as false: {reason}")
+            raise PoolRequestError(f"'{field}' is not supported by the subs-pool Codex module except as false: {reason}")
 
 
 def _with_encrypted_reasoning_include(body: dict) -> dict:
@@ -259,7 +263,50 @@ def _auth_failure_response() -> JSONResponse:
     )
 
 
-def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Upstream, api_key: str) -> Starlette:
+def create_app(
+    *,
+    accounts: AccountStore,
+    chain_store: ChainStore,
+    upstream: Upstream,
+    api_key: str,
+    quota_coordinator: QuotaRefreshCoordinator | None = None,
+) -> Starlette:
+    quota_store = quota_coordinator.store if quota_coordinator is not None else QuotaStore(accounts.root)
+    coordinator = quota_coordinator or QuotaRefreshCoordinator(accounts, quota_store=quota_store)
+
+    async def periodic_quota_refresh(stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                try:
+                    await refresh_async(coordinator, force=False, timeout_seconds=22.0)
+                except Exception:  # noqa: BLE001 - periodic work must not kill the server
+                    continue
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        stop = asyncio.Event()
+        task: asyncio.Task | None = None
+        try:
+            # Startup refresh is bounded and best-effort: an unavailable pool
+            # still starts so clients receive a clear local 503 instead of an
+            # absent service. No request is opened upstream during refresh.
+            try:
+                await refresh_async(coordinator, force=True, timeout_seconds=22.0)
+            except Exception:
+                pass
+            task = asyncio.create_task(periodic_quota_refresh(stop))
+            yield
+        finally:
+            stop.set()
+            if task is not None:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+
     async def responses_endpoint(request: Request) -> JSONResponse | StreamingResponse:
         auth_header = request.headers.get("authorization", "")
         provided = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
@@ -291,29 +338,86 @@ def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Ups
         body = _with_encrypted_reasoning_include(body)
         cfg = _extract_config(body)
         input_items = body["input"]
-        pool_accounts = accounts.list()
+        try:
+            pool_accounts, quota_snapshot = quota_store.read_consistent(accounts)
+        except (AccountError, QuotaStateError, OSError):
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "quota state is unavailable",
+                        "type": "quota_unavailable",
+                        "code": "quota_unavailable",
+                    }
+                },
+                status_code=503,
+            )
 
+        # Resolve affinity independently of eligibility. A bound continuation
+        # may be refreshed in place, but it is never rewritten onto B.
+        bound = chain_store.find_bound(input_items, cfg)
+        bound_account = next((a for a in pool_accounts if a.ref == bound.account_ref), None)
+        bound_unavailable = bound.account_ref is not None and (
+            bound_account is None or not quota_store.is_eligible(bound_account, snapshot=quota_snapshot)
+        )
+        no_current_account = not any(quota_store.is_eligible(account, snapshot=quota_snapshot) for account in pool_accounts)
+        # JIT refresh joins an owner and never retries generation upstream.
+        if bound_unavailable or no_current_account:
+            outcome = await refresh_async(coordinator, force=True, timeout_seconds=22.0)
+            if outcome.snapshot is None:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": "no current quota-eligible account is available",
+                            "type": "quota_unavailable",
+                            "code": "quota_unavailable",
+                        }
+                    },
+                    status_code=503,
+                )
+            try:
+                pool_accounts, quota_snapshot = quota_store.read_consistent(accounts)
+            except (AccountError, QuotaStateError, OSError):
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": "quota state is unavailable",
+                            "type": "quota_unavailable",
+                            "code": "quota_unavailable",
+                        }
+                    },
+                    status_code=503,
+                )
+
+        if bound.account_ref is not None:
+            bound_account = next((a for a in pool_accounts if a.ref == bound.account_ref), None)
+            if bound_account is None or not quota_store.is_eligible(bound_account, snapshot=quota_snapshot):
+                return JSONResponse(
+                    {"error": {"message": "bound account quota is unavailable", "type": "quota_unavailable", "code": "quota_unavailable"}},
+                    status_code=503,
+                )
         try:
             decision = select_account(
                 accounts=pool_accounts,
                 input_items=input_items,
                 cfg=cfg,
                 chain_store=chain_store,
+                quota_store=quota_store,
+                snapshot=quota_snapshot,
             )
         except NoEligibleAccountError as exc:
             return JSONResponse(
                 {
                     "error": {
                         "message": str(exc),
-                        "type": "no_eligible_account",
-                        "code": "no_eligible_account",
+                        "type": "quota_unavailable",
+                        "code": "quota_unavailable",
                     }
                 },
                 status_code=503,
             )
 
         account = accounts.get(decision.account_ref)
-        token_manager = CodexTokenManager(account.auth_path)
+        token_manager = CodexTokenManager(str(account.resolved_auth_path(accounts.root)))
         try:
             # Token read/refresh may perform blocking file and HTTP I/O. Keep
             # it off the event loop so concurrent requests can stream together.
@@ -427,5 +531,6 @@ def create_app(*, accounts: AccountStore, chain_store: ChainStore, upstream: Ups
         routes=[
             Route("/v1/responses", responses_endpoint, methods=["POST"]),
             Route("/health", health),
-        ]
+        ],
+        lifespan=lifespan,
     )

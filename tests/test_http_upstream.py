@@ -11,8 +11,8 @@ import json
 import httpx
 import pytest
 
-from codex_pool.errors import UpstreamTransportError
-from codex_pool.upstream import CODEX_OFFICIAL_BASE_URL, CodexHTTPUpstream
+from subs_pool.modules.codex.errors import UpstreamTransportError
+from subs_pool.modules.codex.upstream import CODEX_OFFICIAL_BASE_URL, CodexHTTPUpstream
 
 
 class _ByteAtATimeStream(httpx.AsyncByteStream):
@@ -68,7 +68,7 @@ async def test_stream_posts_to_configured_url_with_expected_headers_and_forces_s
 
 
 @pytest.mark.asyncio
-async def test_stream_sends_honest_codex_pool_identity_never_lingtai_or_official_cli():
+async def test_stream_retains_honest_codex_pool_wire_identity_never_lingtai_or_official_cli():
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:

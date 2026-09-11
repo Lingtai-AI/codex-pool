@@ -4,7 +4,7 @@ import json
 import httpx
 import pytest
 
-from codex_pool.auth_codex import (
+from subs_pool.modules.codex.auth_codex import (
     CodexAuthError,
     CodexTokenManager,
     is_token_expired_error,
@@ -46,11 +46,13 @@ def test_valid_json_with_invalid_auth_shape_is_unavailable(tmp_path, payload):
     assert manager.get_account_id() is None
 
 
-def test_refresh_triggers_on_near_expiry(tmp_path, monkeypatch):
+def test_refresh_triggers_on_near_expiry(tmp_path):
     auth = tmp_path / "auth.json"
     write_auth_fixture(auth, expires_in=60)  # inside the 300s refresh buffer
 
-    def fake_post(url, data=None, timeout=None):
+    def handler(request):
+        url = str(request.url)
+        data = dict(item.split("=", 1) for item in request.content.decode().split("&"))
         assert data["grant_type"] == "refresh_token"
         assert data["refresh_token"] == "rt-1"
         return httpx.Response(
@@ -59,8 +61,7 @@ def test_refresh_triggers_on_near_expiry(tmp_path, monkeypatch):
             request=httpx.Request("POST", url),
         )
 
-    monkeypatch.setattr("codex_pool.auth_codex.httpx.post", fake_post)
-    mgr = CodexTokenManager(str(auth))
+    mgr = CodexTokenManager(str(auth), transport=httpx.MockTransport(handler))
     token = mgr.get_access_token()
     assert token == "at-2"
     on_disk = json.loads(auth.read_text())
@@ -68,16 +69,16 @@ def test_refresh_triggers_on_near_expiry(tmp_path, monkeypatch):
     assert on_disk["refresh_token"] == "rt-2"
 
 
-def test_refresh_401_raises_codex_auth_error(tmp_path, monkeypatch):
+def test_refresh_401_raises_codex_auth_error(tmp_path):
     auth = tmp_path / "auth.json"
     write_auth_fixture(auth, expires_in=1)
 
-    def fake_post(url, data=None, timeout=None):
+    def handler(_request):
         return httpx.Response(401, json={"error": "invalid_grant"}, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr("codex_pool.auth_codex.httpx.post", fake_post)
+    url = "https://auth.openai.com/oauth/token"
     with pytest.raises(CodexAuthError):
-        CodexTokenManager(str(auth)).get_access_token()
+        CodexTokenManager(str(auth), transport=httpx.MockTransport(handler)).get_access_token()
 
 
 def test_account_id_from_explicit_field(tmp_path):

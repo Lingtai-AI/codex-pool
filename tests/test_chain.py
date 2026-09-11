@@ -1,8 +1,8 @@
 import time
 import uuid
 
-from codex_pool.chain import DEFAULT_MAX_SESSIONS, ChainStore, new_session_id
-from codex_pool.hashing import rolling_hashes
+from subs_pool.modules.codex.chain import DEFAULT_MAX_SESSIONS, ChainStore, new_session_id
+from subs_pool.modules.codex.hashing import rolling_hashes
 
 CFG = {"model": "gpt-5-codex", "instructions": "be helpful", "tools": None}
 
@@ -202,7 +202,7 @@ def test_fresh_id_colliding_with_retained_session_is_regenerated(monkeypatch):
     _commit(store, chain_id="retained", input_items=u1, output_items=o1, account_ref="acct", fresh=True)
 
     ids = iter(["retained", "unused"])
-    monkeypatch.setattr("codex_pool.chain.new_session_id", lambda: next(ids))
+    monkeypatch.setattr("subs_pool.modules.codex.chain.new_session_id", lambda: next(ids))
     other = store.find_match([{"role": "user", "content": "unrelated"}], CFG, {"acct"})
     assert other.chain_id == "unused"
 
@@ -221,7 +221,7 @@ def test_fresh_commit_never_overwrites_a_session_retained_after_find_match(monke
     o_b = [{"type": "message", "content": [{"type": "output_text", "text": "B"}]}]
     _commit(store, chain_id="dup", input_items=u_a, output_items=o_a, account_ref="acct-a", fresh=True)
 
-    monkeypatch.setattr("codex_pool.chain.new_session_id", lambda: "replacement")
+    monkeypatch.setattr("subs_pool.modules.codex.chain.new_session_id", lambda: "replacement")
     _commit(store, chain_id="dup", input_items=u_b, output_items=o_b, account_ref="acct-b", fresh=True)
 
     assert store.record_count() == 2

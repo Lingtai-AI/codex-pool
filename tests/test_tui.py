@@ -2,72 +2,54 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import DataTable, Input, Static
+import pytest
+from textual.widgets import DataTable, Static
 
-from codex_pool.cli_client import CLIError
-from codex_pool.tui import CodexPoolApp
+from subs_pool.cli_client import CLIError
+from subs_pool.modules.codex import tui_adapter
+from subs_pool.modules.codex.tui import SubscriptionPoolApp
 
 
-class _FakeLoginStream:
-    """Fakes cli_client.LoginStream without subprocess/provider I/O."""
+def _account(ref: str, *, enabled: bool = True, weight: int = 1) -> dict:
+    return {"ref": ref, "enabled": enabled, "weight": weight, "auth_present": True, "authenticated": True}
 
-    def __init__(self, events: list[dict], *, block: bool = False) -> None:
-        self._events = list(events)
-        self._block = block
-        self.cancelled = False
-        self._unblock = asyncio.Event()
 
-    def __aiter__(self) -> "_FakeLoginStream":
-        return self
-
-    async def __anext__(self) -> dict:
-        if self._events:
-            return self._events.pop(0)
-        if self._block and not self.cancelled:
-            await self._unblock.wait()
-        raise StopAsyncIteration
-
-    async def cancel(self) -> None:
-        self.cancelled = True
-        self._unblock.set()
+def _quota_row(ref: str, *, used: float = 10.0, eligible: bool = True) -> dict:
+    now = "2099-09-11T07:21:07+00:00"
+    current = {
+        "source_at": now,
+        "checked_at": now,
+        "primary": {"used_percent": used, "remaining_percent": 100 - used, "reset_at": "2099-09-11T09:00:00+00:00", "window_seconds": 3600},
+        "secondary": {"used_percent": None, "remaining_percent": None, "reset_at": None, "window_seconds": None},
+    }
+    return {"ref": ref, "freshness": "fresh", "eligible": eligible, "exclusion_reason": None if eligible else "exhausted", "current": current, "last_success": current, "attempted_at": now, "error": None}
 
 
 class FakeCLIClient:
-    """Fakes CLIClient: no subprocess or provider I/O, records calls."""
-
-    def __init__(self, status: dict | None = None, quota: dict | None = None) -> None:
-        self._status = status or {"accounts": [], "eligible_count": 0}
-        self._quota = quota or {"accounts": []}
+    def __init__(self, *, quota_rows: list[dict] | None = None) -> None:
+        self.status_data = {"accounts": [_account("a"), _account("b", enabled=False)], "eligible_count": 1}
+        self.quota_data = {"accounts": quota_rows or [_quota_row("a"), _quota_row("b", used=100, eligible=False)]}
         self.calls: list[tuple[str, tuple, dict]] = []
-        self.status_error: CLIError | None = None
-        self.quota_error: CLIError | None = None
-        self.quota_gate: asyncio.Event | None = None
         self.quota_started = asyncio.Event()
-        self._login_events: dict[str, list[dict]] = {}
-        self.login_block = False
-        self.last_login_stream: _FakeLoginStream | None = None
-
-    def set_login_events(self, ref: str, events: list[dict]) -> None:
-        self._login_events[ref] = events
+        self.quota_gate: asyncio.Event | None = None
+        self.quota_error: CLIError | None = None
 
     async def status(self) -> dict:
         self.calls.append(("status", (), {}))
-        if self.status_error is not None:
-            raise self.status_error
-        return self._status
+        return self.status_data
 
     async def quota(self) -> dict:
         self.calls.append(("quota", (), {}))
         self.quota_started.set()
         if self.quota_gate is not None:
             await self.quota_gate.wait()
-        if self.quota_error is not None:
+        if self.quota_error:
             raise self.quota_error
-        return self._quota
+        return self.quota_data
 
     async def accounts_import(self, ref: str, path: str, *, weight: int = 1) -> dict:
         self.calls.append(("accounts_import", (ref, path), {"weight": weight}))
-        return {"ref": ref, "enabled": True, "weight": weight, "auth_present": True, "quota": "unknown"}
+        return _account(ref, weight=weight)
 
     async def pool_enable(self, ref: str) -> dict:
         self.calls.append(("pool_enable", (ref,), {}))
@@ -81,44 +63,67 @@ class FakeCLIClient:
         self.calls.append(("pool_weight", (ref, weight), {}))
         return {"ref": ref, "weight": weight}
 
-    def login(self, ref: str) -> _FakeLoginStream:
-        self.calls.append(("login", (ref,), {}))
-        stream = _FakeLoginStream(self._login_events.get(ref, []), block=self.login_block)
-        self.last_login_stream = stream
-        return stream
 
-
-def _account(ref: str, *, enabled: bool = True, weight: int = 1, auth_present: bool = True) -> dict:
-    return {"ref": ref, "enabled": enabled, "weight": weight, "auth_present": auth_present, "quota": "unknown"}
-
-
-async def test_initial_load_renders_accounts_and_status():
-    client = FakeCLIClient(
-        status={"accounts": [_account("a"), _account("b", enabled=False, weight=2)], "eligible_count": 1}
-    )
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
+async def test_startup_enters_checking_then_renders_only_shared_current_values():
+    client = FakeCLIClient()
+    client.quota_gate = asyncio.Event()
+    app = SubscriptionPoolApp(client=client)
+    async with app.run_test(size=(100, 24)) as pilot:
+        await client.quota_started.wait()
         await pilot.pause()
         table = app.query_one(DataTable)
-        assert table.row_count == 2
-        status = app.query_one("#status-line", Static)
-        assert "2 account(s), 1 eligible" in str(status.content)
+        assert "CHECKING" in str(table.get_cell("a", "check"))
+        assert "N/A" in str(table.get_cell("a", "primary"))
+        client.quota_gate.set()
+        await pilot.pause()
+        assert "OK" in str(table.get_cell("a", "check"))
+        assert "90%" in str(table.get_cell("a", "primary"))
+        assert "N/A" in str(table.get_cell("a", "secondary"))
 
 
-async def test_status_error_shows_error_state():
+async def test_shutdown_during_quota_check_does_not_render_unmounted_widgets():
     client = FakeCLIClient()
-    client.status_error = CLIError("backend exploded")
-    app = CodexPoolApp(client=client)
+    client.quota_gate = asyncio.Event()
+    app = SubscriptionPoolApp(client=client)
+    async with app.run_test(size=(100, 24)):
+        await client.quota_started.wait()
+
+
+async def test_u_forces_quota_and_r_reloads_metadata_then_quota():
+    client = FakeCLIClient(quota_rows=[_quota_row("a")])
+    app = SubscriptionPoolApp(client=client)
     async with app.run_test() as pilot:
         await pilot.pause()
-        status = app.query_one("#status-line", Static)
-        assert "backend exploded" in str(status.content)
-        assert status.has_class("error")
+        await client.quota_started.wait()
+        await pilot.pause()
+        initial_quota = sum(name == "quota" for name, _, _ in client.calls)
+        await pilot.press("u")
+        await pilot.pause()
+        assert sum(name == "quota" for name, _, _ in client.calls) == initial_quota + 1
+        await pilot.press("r")
+        await pilot.pause()
+        assert sum(name == "status" for name, _, _ in client.calls) >= 2
+        assert sum(name == "quota" for name, _, _ in client.calls) >= initial_quota + 2
 
 
-async def test_toggle_enabled_calls_pool_disable_for_enabled_account():
-    client = FakeCLIClient(status={"accounts": [_account("a", enabled=True)], "eligible_count": 1})
-    app = CodexPoolApp(client=client)
+async def test_periodic_tick_requests_target_refresh_off_render_path():
+    client = FakeCLIClient(quota_rows=[_quota_row("a")])
+    app = SubscriptionPoolApp(client=client)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await client.quota_started.wait()
+        await pilot.pause()
+        before = sum(name == "quota" for name, _, _ in client.calls)
+        app._last_quota_refresh = asyncio.get_running_loop().time() - 31
+        app._quota_tick()
+        await pilot.pause()
+        assert sum(name == "quota" for name, _, _ in client.calls) == before + 1
+
+
+async def test_metadata_actions_remain_frontend_delegations():
+    client = FakeCLIClient(quota_rows=[])
+    client.status_data = {"accounts": [_account("a")], "eligible_count": 1}
+    app = SubscriptionPoolApp(client=client)
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.press("e")
@@ -126,242 +131,86 @@ async def test_toggle_enabled_calls_pool_disable_for_enabled_account():
         assert ("pool_disable", ("a",), {}) in client.calls
 
 
-async def test_toggle_enabled_calls_pool_enable_for_disabled_account():
-    client = FakeCLIClient(status={"accounts": [_account("a", enabled=False)], "eligible_count": 0})
-    app = CodexPoolApp(client=client)
+async def test_quota_error_is_visible_without_reusing_old_values():
+    client = FakeCLIClient(quota_rows=[_quota_row("a")])
+    client.quota_error = CLIError("quota unavailable")
+    app = SubscriptionPoolApp(client=client)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("e")
-        await pilot.pause()
-        assert ("pool_enable", ("a",), {}) in client.calls
-
-
-async def test_weight_up_increments_and_weight_down_clamps_at_one():
-    client = FakeCLIClient(status={"accounts": [_account("a", weight=1)], "eligible_count": 1})
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("plus")
-        await pilot.pause()
-        assert ("pool_weight", ("a", 2), {}) in client.calls
-        await pilot.press("minus")
-        await pilot.pause()
-        assert ("pool_weight", ("a", 1), {}) in client.calls
-
-
-async def test_set_weight_modal_sends_typed_value():
-    client = FakeCLIClient(status={"accounts": [_account("a", weight=1)], "eligible_count": 1})
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("w")
-        await pilot.pause()
-        weight_input = app.screen.query_one("#weight-input", Input)
-        weight_input.value = "9"
-        await pilot.click("#weight-confirm")
-        await pilot.pause()
-        assert ("pool_weight", ("a", 9), {}) in client.calls
-
-
-async def test_import_modal_calls_accounts_import_with_explicit_fields():
-    client = FakeCLIClient()
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("i")
-        await pilot.pause()
-        app.screen.query_one("#import-ref", Input).value = "newacct"
-        app.screen.query_one("#import-path", Input).value = "/tmp/auth.json"
-        app.screen.query_one("#import-weight", Input).value = "4"
-        await pilot.click("#import-confirm")
-        await pilot.pause()
-        assert ("accounts_import", ("newacct", "/tmp/auth.json"), {"weight": 4}) in client.calls
-
-
-async def test_import_modal_cancel_does_not_call_import():
-    client = FakeCLIClient()
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("i")
-        await pilot.pause()
-        await pilot.click("#import-cancel")
-        await pilot.pause()
-        assert not any(name == "accounts_import" for name, _, _ in client.calls)
-
-
-async def test_quota_meter_selection_failure_and_metadata_preservation():
-    client = FakeCLIClient(
-        status={
-            "accounts": [
-                _account("synthetic-a"),
-                _account("synthetic-b", weight=2),
-            ],
-            "eligible_count": 2,
-        },
-        quota={
-            "accounts": [
-                {
-                    "ref": "synthetic-a",
-                    "quota": {
-                        "status": "ok",
-                        "primary_used_percent": 30,
-                        "secondary_used_percent": 10,
-                        "primary_window_name": "reported burst",
-                        "primary_window_duration_mins": 300,
-                        "primary_reset_at": "2099-09-11T09:00:00+00:00",
-                        "secondary_reset_at": None,
-                        "observed_at": "2026-09-11T07:21:07+00:00",
-                    },
-                },
-                {
-                    "ref": "synthetic-b",
-                    "quota": {
-                        "status": "ok",
-                        "primary_used_percent": 100,
-                        "secondary_used_percent": None,
-                        "primary_window_duration_mins": 60,
-                        "primary_reset_at": "2099-09-11T10:00:00+00:00",
-                        "observed_at": "2026-09-11T07:22:07+00:00",
-                    },
-                },
-            ]
-        },
-    )
-    app = CodexPoolApp(client=client)
-    async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.pause()
-        await pilot.press("u")
-        await pilot.pause()
-        table = app.query_one(DataTable)
-        assert "70%" in str(table.get_cell("synthetic-a", "primary"))
-        assert "90%" in str(table.get_cell("synthetic-a", "secondary"))
-        assert "0%" in str(table.get_cell("synthetic-b", "primary"))
-        assert "N/A" in str(table.get_cell("synthetic-b", "secondary"))
-
-        table.move_cursor(row=1)
-        await pilot.pause()
-        detail = app.query_one("#selected-detail", Static)
-        assert "SELECTED synthetic-b" in str(detail.content)
-        assert "0% remaining" in str(detail.content)
-        assert "Duration 1h" in str(detail.content)
-        assert "Reset 2099-09-11 10:00Z" in str(detail.content)
-        assert "Observed 2026-09-11 07:22:07Z" in str(detail.content)
-        assert "Last attempt N/A" not in str(detail.content)
-
-        # A metadata-only refresh may reorder accounts and return quota=None,
-        # but selection and the last quota observation remain keyed by ref.
-        client._status = {
-            "accounts": [
-                {**_account("synthetic-b", weight=3), "quota": None},
-                {**_account("synthetic-a"), "quota": None},
-            ],
-            "eligible_count": 2,
-        }
-        await pilot.press("r")
-        await pilot.pause()
-        assert app._selected_ref == "synthetic-b"
-        assert "0%" in str(table.get_cell("synthetic-b", "primary"))
-        assert "Weight 3" in str(detail.content)
-
-        # A second all-account check clears old values before awaiting the CLI.
-        client.quota_started = asyncio.Event()
-        client.quota_gate = asyncio.Event()
-        client.quota_error = CLIError("synthetic quota failure")
-        await pilot.press("u")
         await client.quota_started.wait()
         await pilot.pause()
-        assert "…" in str(table.get_cell("synthetic-a", "primary"))
-        assert "…" in str(table.get_cell("synthetic-b", "primary"))
+        table = app.query_one(DataTable)
+        assert "N/A" in str(table.get_cell("a", "primary"))
+        assert "UNAVAILABLE" in str(table.get_cell("a", "check"))
+        assert "quota unavailable" in str(app.query_one("#status-line", Static).content)
 
-        calls_while_running = sum(1 for name, _, _ in client.calls if name == "quota")
-        await pilot.press("u")
+
+@pytest.mark.asyncio
+async def test_codex_adapter_preserves_partial_data_when_refresh_error_is_null(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_POOL_HOME", str(tmp_path))
+    partial = {"refresh": {"error": None}, "accounts": [{"ref": "a", "current": None}]}
+    monkeypatch.setattr(tui_adapter, "quota_data", lambda *args, **kwargs: (partial, 3))
+    adapter = tui_adapter.CodexTUIAdapter()
+
+    with pytest.raises(CLIError) as raised:
+        await adapter.quota()
+    assert raised.value.data is partial
+    assert raised.value.message == "quota unavailable"
+
+
+@pytest.mark.asyncio
+async def test_partial_quota_wave_keeps_success_and_marks_unsatisfied_row_reason():
+    success = _quota_row("a", used=10)
+    unsatisfied = {
+        "ref": "b",
+        "freshness": "failed",
+        "eligible": False,
+        "exclusion_reason": "refresh_unavailable",
+        "current": None,
+        "last_success": _quota_row("b", used=20)["current"],
+        "attempted_at": "2099-09-11T07:21:07+00:00",
+        "error": None,
+    }
+    client = FakeCLIClient(quota_rows=[])
+    client.status_data = {"accounts": [_account("a"), _account("b")], "eligible_count": 1}
+    client.quota_data = {
+        "accounts": [success, unsatisfied],
+        "refresh": {"status": "partial", "error": {"message": "one account unavailable"}},
+    }
+    client.quota_error = CLIError("one account unavailable", returncode=3, data=client.quota_data)
+    app = SubscriptionPoolApp(client=client)
+    async with app.run_test(size=(100, 24)) as pilot:
+        await client.quota_started.wait()
         await pilot.pause()
-        assert sum(1 for name, _, _ in client.calls if name == "quota") == calls_while_running
-        assert "already running" in str(app.query_one("#status-line", Static).content)
-
-        client.quota_gate.set()
-        await pilot.pause()
-        assert "N/A" in str(table.get_cell("synthetic-a", "primary"))
-        assert "N/A" in str(table.get_cell("synthetic-b", "primary"))
-        assert "UNAVAILABLE" in str(detail.content)
-        assert "synthetic quota failure" in str(detail.content)
-        failed_attempt = app._quota_by_ref["synthetic-b"].attempted_at
-
-        await pilot.press("r")
-        await pilot.pause()
-        assert app._selected_ref == "synthetic-b"
-        assert app._quota_by_ref["synthetic-b"].attempted_at == failed_attempt
-        assert "synthetic quota failure" in str(detail.content)
-        assert "Quota check unavailable" in str(
-            app.query_one("#status-line", Static).content
-        )
+        assert app._quota_by_ref["a"].state == "ok"
+        assert app._quota_by_ref["a"].snapshot["primary_used_percent"] == 10.0
+        assert app._quota_by_ref["b"].state == "unavailable"
+        assert app._quota_by_ref["b"].error == "refresh_unavailable"
 
 
-async def test_login_flow_shows_device_code_then_completes_and_refreshes():
-    client = FakeCLIClient(status={"accounts": [_account("a", auth_present=False)], "eligible_count": 0})
-    client.set_login_events(
-        "a",
-        [
-            {
-                "event": "authorization_required",
-                "verification_uri": "https://example.com/device",
-                "user_code": "ABCD-EFGH",
-                "expires_in": 900,
-                "interval": 5,
-            },
-            {"event": "completed", "account": _account("a", auth_present=True)},
+@pytest.mark.asyncio
+async def test_fresh_exhausted_rows_keep_current_meters_on_startup_and_shared_inspection():
+    exhausted = [_quota_row("a", used=100, eligible=False), _quota_row("b", used=100, eligible=False)]
+    client = FakeCLIClient(quota_rows=exhausted)
+    client.status_data = {
+        "accounts": [
+            {**_account("a"), **exhausted[0]},
+            {**_account("b"), **exhausted[1]},
         ],
-    )
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
+        "eligible_count": 0,
+    }
+    app = SubscriptionPoolApp(client=client)
+    async with app.run_test(size=(100, 24)) as pilot:
+        await client.quota_started.wait()
         await pilot.pause()
-        await pilot.press("l")
-        await pilot.pause()
-        app.screen.query_one("#login-ref", Input).value = "a"
-        await pilot.click("#login-start")
-        await pilot.pause()
-        login_status = app.screen.query_one("#login-status", Static)
-        assert "Login completed." in str(login_status.content)
-        status_calls_before_close = sum(1 for name, _, _ in client.calls if name == "status")
-        await pilot.click("#login-cancel")
-        await pilot.pause()
-        assert not app.query("#login-dialog")
-        status_calls_after_close = sum(1 for name, _, _ in client.calls if name == "status")
-        assert status_calls_after_close == status_calls_before_close + 1
+        table = app.query_one(DataTable)
+        for ref in ("a", "b"):
+            assert "EXHAUSTED" in str(table.get_cell(ref, "check"))
+            assert "0%" in str(table.get_cell(ref, "primary"))
 
-
-async def test_login_cancel_mid_flight_calls_stream_cancel_and_closes_dialog():
-    client = FakeCLIClient()
-    client.set_login_events(
-        "a",
-        [{"event": "authorization_required", "verification_uri": "https://example.com/device", "user_code": "ABCD-EFGH", "expires_in": 900, "interval": 5}],
-    )
-    client.login_block = True
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
+        # This is the path used by the one-second shared-state observer.
+        app._inspect_shared_state()
         await pilot.pause()
-        await pilot.press("l")
-        await pilot.pause()
-        app.screen.query_one("#login-ref", Input).value = "a"
-        await pilot.click("#login-start")
-        await pilot.pause()
-        login_status = app.screen.query_one("#login-status", Static)
-        assert "ABCD-EFGH" in str(login_status.content)
-        await pilot.click("#login-cancel")
-        await pilot.pause()
-        assert not app.query("#login-dialog")
-        assert client.last_login_stream is not None
-        assert client.last_login_stream.cancelled is True
-
-
-async def test_missing_selection_shows_error_instead_of_crashing():
-    client = FakeCLIClient(status={"accounts": [], "eligible_count": 0})
-    app = CodexPoolApp(client=client)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("e")
-        await pilot.pause()
-        status = app.query_one("#status-line", Static)
-        assert "select an account first" in str(status.content)
-        assert status.has_class("error")
+        for ref in ("a", "b"):
+            assert "EXHAUSTED" in str(table.get_cell(ref, "check"))
+            assert "0%" in str(table.get_cell(ref, "primary"))

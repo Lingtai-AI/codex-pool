@@ -1,10 +1,10 @@
-"""Thin async subprocess wrapper around the codex-pool CLI JSON contract.
+"""Thin async subprocess wrapper around a subs-pool module CLI contract.
 
-This module owns no account/token/auth state and makes no provider HTTP calls:
-every method shells out to ``[sys.executable, "-m", "codex_pool", ...]`` (never
-``shell=True``, never a secret in argv) and parses the stable JSON the CLI
-promises. The subprocess spawn function is injectable so tests can supply a
-fake process without starting a real one.
+This module owns no account/token/auth state and makes no provider HTTP calls.
+Machine-safe operations use the JSON-only ``subspool-cli`` module entrypoint;
+the human TUI's device-login stream uses the human dispatcher with a private
+JSONL adapter. The subprocess spawn function is injectable so tests can supply
+a fake process without starting a real one.
 """
 
 from __future__ import annotations
@@ -18,12 +18,13 @@ from typing import Any, Protocol
 
 
 class CLIError(Exception):
-    """Raised when the codex-pool CLI exits non-zero or emits bad output."""
+    """Raised when a subs-pool module CLI exits non-zero or emits bad output."""
 
-    def __init__(self, message: str, *, returncode: int | None = None) -> None:
+    def __init__(self, message: str, *, returncode: int | None = None, data: dict | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.returncode = returncode
+        self.data = data
 
 
 class Process(Protocol):
@@ -49,7 +50,19 @@ async def _default_spawn(args: Sequence[str]) -> Process:
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
-        "codex_pool",
+        "subs_pool.agent_cli",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def _default_human_spawn(args: Sequence[str]) -> Process:
+    """Run the human dispatcher for the TUI-only login event stream."""
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "subs_pool.cli",
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -77,7 +90,7 @@ def _safe_text(text: str) -> str:
 def _parse_error(stderr: bytes) -> str:
     text = stderr.decode(errors="replace").strip()
     if not text:
-        return "codex-pool CLI exited with an error (no message)"
+        return "subs-pool module CLI exited with an error (no message)"
     # Contract errors are one JSON object on the last non-empty stderr line.
     # A broken installation may instead produce a traceback; retain a bounded,
     # redacted diagnostic rather than dumping unbounded/provider-tainted text.
@@ -88,7 +101,9 @@ def _parse_error(stderr: bytes) -> str:
     if isinstance(payload, dict):
         if isinstance(payload.get("error"), str):
             return _safe_text(payload["error"])
-        return "codex-pool CLI returned a malformed error response"
+        if isinstance(payload.get("error"), dict):
+            return _safe_text(str(payload["error"].get("message", "module CLI failed")))
+        return "subs-pool module CLI returned a malformed error response"
     return _safe_text(text)
 
 
@@ -125,7 +140,7 @@ async def _spawn_or_raise(spawn: Spawner, args: Sequence[str]) -> Process:
         return await spawn(args)
     except FileNotFoundError as exc:
         raise CLIError(
-            "codex-pool CLI not found: is codex-pool installed for this interpreter?"
+            "subs-pool CLI not found: is subs-pool installed for this interpreter?"
         ) from exc
 
 
@@ -152,7 +167,7 @@ async def _terminate_process(proc: Process) -> None:
 
 
 class LoginStream:
-    """One in-flight ``accounts login REF --device --json`` process.
+    """One in-flight device-login event stream for the human frontend.
 
     Async-iterate this to receive parsed JSONL events as they arrive. A
     ``completed`` line is held until the child has drained its pipes and exited
@@ -260,25 +275,41 @@ class LoginStream:
 
 
 class CLIClient:
-    """Async wrapper for the codex-pool CLI's ``--json`` command surface."""
+    """Async wrapper for one module's machine command surface."""
 
-    def __init__(self, spawn: Spawner | None = None, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        module_id: str,
+        spawn: Spawner | None = None,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        self.module_id = module_id
         self._spawn = spawn or _default_spawn
         # Bounds one-shot commands (status/quota/pool/import/etc.), not the
         # device-login provider poll window owned by the CLI subprocess.
         self._timeout = timeout
 
     async def _run_json(self, args: Sequence[str]) -> dict:
-        proc = await _spawn_or_raise(self._spawn, [*args, "--json"])
+        proc = await _spawn_or_raise(
+            self._spawn, [self.module_id, *args]
+        )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self._timeout)
         except asyncio.TimeoutError as exc:
             await _terminate_process(proc)
-            raise CLIError(f"codex-pool CLI timed out after {self._timeout:g}s") from exc
+            raise CLIError(f"subs-pool module CLI timed out after {self._timeout:g}s") from exc
         except asyncio.CancelledError:
             await _terminate_process(proc)
             raise
         if proc.returncode != 0:
+            try:
+                payload = json.loads(stdout.decode(errors="replace"))
+                error = payload.get("error") if isinstance(payload, dict) else None
+                if isinstance(error, dict):
+                    raise CLIError(str(error.get("message", "module CLI failed")), returncode=proc.returncode, data=payload.get("data") if isinstance(payload.get("data"), dict) else None)
+            except json.JSONDecodeError:
+                pass
             raise CLIError(_parse_error(stderr), returncode=proc.returncode)
         try:
             payload = json.loads(stdout.decode(errors="replace"))
@@ -288,24 +319,33 @@ class CLIClient:
             raise CLIError(
                 f"malformed CLI output: expected a JSON object, got {type(payload).__name__}"
             )
+        if payload.get("schema_version") == 1 and "ok" in payload:
+            if not payload.get("ok"):
+                if isinstance(payload.get("data"), dict):
+                    return payload["data"]
+                error = payload.get("error")
+                message = error.get("message", "module CLI failed") if isinstance(error, dict) else "module CLI failed"
+                raise CLIError(str(message), returncode=proc.returncode)
+            data = payload.get("data")
+            return data if isinstance(data, dict) else {}
         return payload
 
     async def accounts_list(self) -> dict:
-        return await self._run_json(["accounts", "list"])
+        return await self._run_json(["account", "list"])
 
     async def accounts_import(self, ref: str, path: str, *, weight: int = 1) -> dict:
         return await self._run_json(
-            ["accounts", "import", ref, "--path", path, "--weight", str(weight)]
+            ["account", "import", ref, "--path", path, "--weight", str(weight)]
         )
 
     async def pool_enable(self, ref: str) -> dict:
-        return await self._run_json(["pool", "enable", ref])
+        return await self._run_json(["account", "enable", ref])
 
     async def pool_disable(self, ref: str) -> dict:
-        return await self._run_json(["pool", "disable", ref])
+        return await self._run_json(["account", "disable", ref])
 
     async def pool_weight(self, ref: str, weight: int) -> dict:
-        return await self._run_json(["pool", "weight", ref, str(weight)])
+        return await self._run_json(["account", "weight", ref, str(weight)])
 
     async def status(self) -> dict:
         return await self._run_json(["status"])
@@ -315,7 +355,11 @@ class CLIClient:
 
     def login(self, ref: str) -> LoginStream:
         """Start login lazily, on first iteration."""
-        return LoginStream(self._spawn, ["accounts", "login", ref, "--device", "--json"])
+        spawn = _default_human_spawn if self._spawn is _default_spawn else self._spawn
+        return LoginStream(
+            spawn,
+            [self.module_id, "account", "login", ref, "--device", "--events-jsonl"],
+        )
 
 
 __all__ = ["CLIClient", "CLIError", "LoginStream", "Process", "Spawner"]

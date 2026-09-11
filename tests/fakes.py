@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from codex_pool.errors import UpstreamTransportError
+from subs_pool.modules.codex.errors import UpstreamTransportError
 
 
 def write_auth_fixture(

@@ -20,7 +20,7 @@ The source ``oauth.go`` also implements a *browser* PKCE flow
 (``startOAuthFlow``: local HTTP listener + system browser + localhost
 callback). That flow is not headless-CLI-shaped (it needs a bound local port
 and a real browser), so it is intentionally not ported here — only the
-device-code flow, which is what the frontend contract pins (``accounts login
+device-code flow, which is what the frontend contract pins (``account login
 REF --device``). If browser-based login is ever required, it needs a real UX
 decision, not silent invention.
 
@@ -225,15 +225,15 @@ def run_device_login(
     Yields ``{"event": "authorization_required", ...}`` once the code is
     issued, then (after this generator is driven to completion) a final
     ``{"event": "completed", "account": {...status...}}``. Raises
-    :class:`DeviceLoginError` (or :class:`~codex_pool.accounts.AccountError`)
+    :class:`DeviceLoginError` (or :class:`~subs_pool.modules.codex.accounts.AccountError`)
     on any failure — callers must not treat partial iteration as success.
 
     Re-running login for an existing ``ref`` preserves that account's current
     ``enabled``/``weight`` pool state and only replaces its auth file
     pointer; ``weight`` only applies when ``ref`` is new.
     """
-    if not ref or "/" in ref or "\\" in ref or ref in {".", ".."}:
-        raise AccountError(f"invalid account ref: {ref!r}")
+    if not isinstance(ref, str) or not ref or "/" in ref or "\\" in ref or ref in {".", ".."}:
+        raise AccountError("account ref must be a non-empty path-safe string")
 
     store = account_store or AccountStore()
 
@@ -259,12 +259,12 @@ def run_device_login(
     bundle = exchange_code(client, approval["authorization_code"], approval["code_verifier"])
 
     path = _auth_file_path(ref)
-    _write_auth_file_atomic(path, bundle)
-
     try:
         existing = store.get(ref)
     except AccountError:
         existing = None
+    _write_auth_file_atomic(path, bundle)
+
     if existing is not None:
         account: Account = store.set_auth_path(ref, str(path))
     else:

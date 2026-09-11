@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass
+from pathlib import Path
 
 from .accounts import Account
 from .auth_codex import CodexTokenManager
 from .chain import ChainStore, MatchResult
+from .quota_store import QuotaStore
 
 
 class NoEligibleAccountError(Exception):
@@ -31,23 +33,34 @@ class RoutingDecision:
     prefix_hashes: list
 
 
-def _is_authenticated(account: Account) -> bool:
+def _is_authenticated(account: Account, *, root: Path | None = None) -> bool:
     try:
-        return CodexTokenManager(account.auth_path).is_authenticated()
+        path = account.resolved_auth_path(root or Path.cwd())
+        return CodexTokenManager(str(path)).is_authenticated()
     except (FileNotFoundError, OSError, ValueError):
         return False
 
 
-def eligible_refs(accounts: list[Account]) -> set[str]:
-    # An account is excluded only by explicit pool disable, missing/invalid
-    # authentication, or a persisted quota observation proving exhaustion.
-    # Unknown quota remains eligible.
+def eligible_refs(
+    accounts: list[Account],
+    *,
+    quota_store: QuotaStore | None = None,
+    snapshot: dict | None = None,
+) -> set[str]:
+    """Return only accounts with a current, committed quota sample.
+
+    A missing sidecar is intentionally not an eligible state. The optional
+    store argument is useful to callers that already hold a consistent
+    snapshot; production routing always supplies the shared store.
+    """
+    if quota_store is None:
+        quota_store = QuotaStore()
     return {
         account.ref
         for account in accounts
         if account.enabled
-        and account.quota_exhausted is not True
-        and _is_authenticated(account)
+        and _is_authenticated(account, root=quota_store.root)
+        and quota_store.is_eligible(account, snapshot=snapshot)
     }
 
 
@@ -82,10 +95,19 @@ def select_account(
     cfg: dict,
     chain_store: ChainStore,
     randbelow=None,
+    quota_store: QuotaStore | None = None,
+    snapshot: dict | None = None,
 ) -> RoutingDecision:
-    elig = eligible_refs(accounts)
+    elig = eligible_refs(accounts, quota_store=quota_store, snapshot=snapshot)
     if not elig:
-        raise NoEligibleAccountError("no enabled, authenticated pool accounts")
+        raise NoEligibleAccountError("no current quota-eligible account")
+
+    # Preserve hard continuation affinity: a matching committed chain whose
+    # bound account has gone stale/exhausted is a local unavailable result,
+    # not permission to rewrite the conversation onto another account.
+    bound = chain_store.find_bound(input_items, cfg)
+    if bound.account_ref is not None and bound.account_ref not in elig:
+        raise NoEligibleAccountError("the bound account has no current quota")
 
     match: MatchResult = chain_store.find_match(input_items, cfg, elig)
     if match.account_ref is not None:

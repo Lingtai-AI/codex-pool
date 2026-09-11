@@ -1,6 +1,6 @@
 import pytest
 
-from codex_pool.sse import SSEDecoder, decode_sse_stream, encode_event
+from subs_pool.modules.codex.sse import SSEDecoder, decode_sse_stream, encode_event
 
 
 def test_decode_full_event_in_one_chunk():

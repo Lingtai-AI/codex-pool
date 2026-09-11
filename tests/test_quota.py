@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import time
 from datetime import datetime
 
 import httpx
@@ -9,12 +11,42 @@ import pytest
 
 from fakes import write_auth_fixture
 
-from codex_pool.quota import QuotaResult, read_quota
+from subs_pool.modules.codex.quota import QuotaResult, read_quota
+
+
+class _DripStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes], clock: list[float], step: float, closed: list[bool]) -> None:
+        self.chunks = chunks
+        self.clock = clock
+        self.step = step
+        self.closed = closed
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.clock[0] += self.step
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed.append(True)
+
+
+class _BlockedAfterChunk(httpx.AsyncByteStream):
+    def __init__(self, closed: list[bool], *, delay: float = 0.03) -> None:
+        self.closed = closed
+        self.delay = delay
+
+    async def __aiter__(self):
+        await asyncio.sleep(self.delay)
+        yield b"{"
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed.append(True)
 
 
 def test_quota_direct_get_normalizes_snake_case_windows_without_writing_auth(tmp_path):
     auth = tmp_path / "auth.json"
-    write_auth_fixture(auth, expires_in=-3_600)
+    write_auth_fixture(auth, expires_in=3_600)
     original_auth = auth.read_bytes()
     requests: list[httpx.Request] = []
 
@@ -70,6 +102,171 @@ def test_quota_direct_get_normalizes_snake_case_windows_without_writing_auth(tmp
     assert "error" not in result.to_dict()
 
 
+def test_expired_access_token_refreshes_once_then_makes_one_wham_request(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth, expires_in=-3600)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method + " " + str(request.url))
+        if request.url.host == "auth.openai.com":
+            return httpx.Response(200, json={"access_token": "at-2", "expires_in": 3600})
+        assert request.headers["authorization"] == "Bearer at-2"
+        return httpx.Response(200, json={"rate_limit": {"primary_window": {"used_percent": 10}}})
+
+    result = read_quota(auth, transport=httpx.MockTransport(handler), timeout_seconds=8)
+
+    assert result.status == "ok"
+    assert calls == ["POST https://auth.openai.com/oauth/token", "GET https://chatgpt.com/backend-api/wham/usage"]
+
+
+def test_auth_and_wham_share_one_monotonic_budget_and_wham_is_not_retried(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth, expires_in=-3600)
+    monotonic = [0.0]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.url.host == "auth.openai.com":
+            monotonic[0] = 7.5
+            return httpx.Response(200, json={"access_token": "at-2", "expires_in": 3600})
+        monotonic[0] = 8.1
+        return httpx.Response(200, json={"rate_limit": {"primary_window": {"used_percent": 10}}})
+
+    result = read_quota(
+        auth,
+        transport=httpx.MockTransport(handler),
+        timeout_seconds=8,
+        monotonic_fn=lambda: monotonic[0],
+    )
+
+    assert calls == ["POST", "GET"]
+    assert result.status == "unavailable"
+    assert result.error == "request_timeout"
+
+
+def test_slow_drip_wham_body_is_cut_off_by_absolute_deadline_and_closed(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    clock = [0.0]
+    closed: list[bool] = []
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(
+            200,
+            stream=_DripStream([b'{"rate_limit":', b'{"primary_window":', b'{"used_percent":10}}}'], clock, 3.0, closed),
+        )
+
+    result = read_quota(
+        auth,
+        transport=httpx.MockTransport(handler),
+        timeout_seconds=8,
+        monotonic_fn=lambda: clock[0],
+    )
+
+    assert result.status == "unavailable"
+    assert result.error == "request_timeout"
+    assert calls == ["GET"]
+    assert closed == [True]
+
+
+def test_slow_drip_token_body_exhausts_budget_without_starting_wham(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth, expires_in=-3600)
+    clock = [0.0]
+    closed: list[bool] = []
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(
+            200,
+            stream=_DripStream([b'{"access_token":"at-2",', b'"expires_in":3600}'], clock, 9.0, closed),
+        )
+
+    result = read_quota(
+        auth,
+        transport=httpx.MockTransport(handler),
+        timeout_seconds=8,
+        monotonic_fn=lambda: clock[0],
+    )
+
+    assert result.status == "unavailable"
+    assert result.error == "request_timeout"
+    assert calls == ["POST"]
+    assert closed == [True]
+
+
+def test_blocked_token_body_is_aborted_at_absolute_deadline_without_wham(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth, expires_in=-3600)
+    calls: list[str] = []
+    closed: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(200, stream=_BlockedAfterChunk(closed))
+
+    started = time.monotonic()
+    result = read_quota(auth, transport=httpx.MockTransport(handler), timeout_seconds=0.08)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.75
+    assert result.status == "unavailable"
+    assert result.error == "request_timeout"
+    assert calls == ["POST"]
+    assert closed == [True]
+
+
+def test_blocked_wham_body_is_aborted_at_absolute_deadline_and_closed(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    calls: list[str] = []
+    closed: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(200, stream=_BlockedAfterChunk(closed))
+
+    started = time.monotonic()
+    result = read_quota(auth, transport=httpx.MockTransport(handler), timeout_seconds=0.08)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.75
+    assert result.status == "unavailable"
+    assert result.error == "request_timeout"
+    assert calls == ["GET"]
+    assert closed == [True]
+
+
+def test_blocked_headers_are_aborted_at_absolute_deadline(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    calls: list[str] = []
+    closed: list[bool] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.append(True)
+        raise AssertionError("unreachable")
+
+    started = time.monotonic()
+    result = read_quota(auth, transport=httpx.MockTransport(handler), timeout_seconds=0.08)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.75
+    assert result.status == "unavailable"
+    assert result.error == "request_timeout"
+    assert calls == ["GET"]
+    assert closed == [True]
+
+
 def test_quota_accepts_camel_case_fields_and_legacy_window_shape(tmp_path):
     auth = tmp_path / "auth.json"
     write_auth_fixture(auth)
@@ -98,6 +295,146 @@ def test_quota_accepts_camel_case_fields_and_legacy_window_shape(tmp_path):
     assert result.primary_window_duration_mins == 60.0
     assert result.secondary_used_percent is None
     assert result.secondary_remaining_percent is None
+
+
+@pytest.mark.parametrize(
+    "secondary",
+    [
+        None,
+        [],
+        "bad",
+        0,
+        {},
+        {"used_percent": None},
+        {"used_percent": 10, "reset_at": "not-a-timestamp"},
+        {"used_percent": 10, "window_duration_mins": "not-a-duration"},
+    ],
+)
+def test_explicit_malformed_secondary_is_unavailable(tmp_path, secondary):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={
+        "rate_limit": {"primary_window": {"used_percent": 10}, "secondary_window": secondary}
+    }))
+
+    result = read_quota(auth, transport=transport)
+
+    assert result.status == "unavailable"
+    assert result.error == "quota_fields_malformed"
+
+
+@pytest.mark.parametrize(
+    "secondary",
+    [
+        {"used_percent": 10, "usedPercent": "bad"},
+        {"reset_at": 1_700_000_000, "resetsAt": "bad", "used_percent": 10},
+        {"window_duration_mins": 60, "windowDurationMins": "bad", "used_percent": 10},
+        {"used_percent": 10, "usedPercent": 20},
+        {"window_duration_mins": 60, "limit_window_seconds": 7200, "used_percent": 10},
+    ],
+)
+def test_explicit_secondary_alias_conflicts_or_invalid_alternate_is_unavailable(tmp_path, secondary):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={
+        "rate_limit": {"primary_window": {"used_percent": 10}, "secondary_window": secondary}
+    }))
+
+    result = read_quota(auth, transport=transport)
+
+    assert result.status == "unavailable"
+    assert result.error == "quota_fields_malformed"
+
+
+def test_explicit_secondary_equal_aliases_are_unambiguous(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={
+        "rate_limit": {
+            "primary_window": {"used_percent": 10},
+            "secondary_window": {
+                "used_percent": 10, "usedPercent": 10.0,
+                "reset_at": 1_700_000_000, "resetsAt": "1700000000",
+                "window_duration_mins": 60, "windowDurationMins": 60.0,
+                "limit_window_seconds": 3600,
+            },
+        }
+    }))
+
+    result = read_quota(auth, transport=transport)
+
+    assert result.status == "ok"
+    assert result.secondary_used_percent == 10.0
+    assert result.secondary_window_duration_mins == 60.0
+
+
+@pytest.mark.parametrize(
+    ("containers", "expected"),
+    [
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": {"used_percent": "bad"}},
+            "quota_fields_malformed",
+        ),
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": None},
+            "quota_fields_malformed",
+        ),
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": []},
+            "quota_fields_malformed",
+        ),
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": "bad"},
+            "quota_fields_malformed",
+        ),
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": {}},
+            "quota_fields_malformed",
+        ),
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": {"used_percent": 20}},
+            "quota_fields_malformed",
+        ),
+        (
+            {
+                "secondary_window": {"used_percent": 10, "reset_at": 1_700_000_000},
+                "secondary": {"used_percent": 10, "reset_at": 1_700_000_100},
+            },
+            "quota_fields_malformed",
+        ),
+        (
+            {
+                "secondary_window": {"used_percent": 10, "window_duration_mins": 60},
+                "secondary": {"used_percent": 10, "window_duration_mins": 120},
+            },
+            "quota_fields_malformed",
+        ),
+        (
+            {
+                "secondary_window": {"used_percent": 10, "window_name": "short"},
+                "secondary": {"used_percent": 10, "window_name": "long"},
+            },
+            "quota_fields_malformed",
+        ),
+        (
+            {"secondary_window": {"used_percent": 10}, "secondary": {"usedPercent": 10.0}},
+            None,
+        ),
+        ({"secondary_window": {"used_percent": 10}}, None),
+        ({}, None),
+    ],
+)
+def test_secondary_outer_container_aliases_are_all_validated(tmp_path, containers, expected):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={
+        "rate_limit": {"primary_window": {"used_percent": 10}, **containers}
+    }))
+
+    result = read_quota(auth, transport=transport)
+
+    assert result.status == ("ok" if expected is None else "unavailable")
+    assert result.error == expected
 
 
 def test_quota_does_not_require_refresh_token_or_refresh_missing_account_id(tmp_path):

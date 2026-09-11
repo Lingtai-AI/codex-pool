@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from codex_pool.cli_client import CLIClient, CLIError
+from subs_pool.cli_client import CLIClient, CLIError
 
 
 class FakeStream:
@@ -73,55 +73,55 @@ def make_spawner(proc: FakeProcess, recorded: list[list[str]] | None = None):
 async def test_accounts_list_parses_json_and_builds_argv():
     recorded: list[list[str]] = []
     proc = FakeProcess(stdout_lines=[json.dumps({"accounts": []}).encode() + b"\n"])
-    client = CLIClient(spawn=make_spawner(proc, recorded))
+    client = CLIClient("codex", spawn=make_spawner(proc, recorded))
 
     result = await client.accounts_list()
 
     assert result == {"accounts": []}
-    assert recorded == [["accounts", "list", "--json"]]
+    assert recorded == [["codex", "account", "list"]]
 
 
 async def test_accounts_import_builds_argv_with_explicit_path_and_weight():
     recorded: list[list[str]] = []
     proc = FakeProcess(stdout_lines=[json.dumps({"ref": "a", "enabled": True}).encode()])
-    client = CLIClient(spawn=make_spawner(proc, recorded))
+    client = CLIClient("codex", spawn=make_spawner(proc, recorded))
 
     result = await client.accounts_import("a", "/tmp/auth.json", weight=3)
 
     assert result["ref"] == "a"
-    assert recorded == [["accounts", "import", "a", "--path", "/tmp/auth.json", "--weight", "3", "--json"]]
+    assert recorded == [["codex", "account", "import", "a", "--path", "/tmp/auth.json", "--weight", "3"]]
 
 
 async def test_pool_enable_disable_weight_argv():
     for coro_name, args, expected in [
-        ("pool_enable", ("a",), ["pool", "enable", "a", "--json"]),
-        ("pool_disable", ("a",), ["pool", "disable", "a", "--json"]),
-        ("pool_weight", ("a", 5), ["pool", "weight", "a", "5", "--json"]),
+        ("pool_enable", ("a",), ["account", "enable", "a"]),
+        ("pool_disable", ("a",), ["account", "disable", "a"]),
+        ("pool_weight", ("a", 5), ["account", "weight", "a", "5"]),
     ]:
         recorded: list[list[str]] = []
         proc = FakeProcess(stdout_lines=[json.dumps({"ref": "a"}).encode()])
-        client = CLIClient(spawn=make_spawner(proc, recorded))
+        client = CLIClient("codex", spawn=make_spawner(proc, recorded))
         await getattr(client, coro_name)(*args)
-        assert recorded == [expected]
+        assert recorded == [["codex", *expected]]
 
 
 async def test_status_and_quota_argv():
     proc = FakeProcess(stdout_lines=[json.dumps({"accounts": [], "eligible_count": 0}).encode()])
     recorded: list[list[str]] = []
-    client = CLIClient(spawn=make_spawner(proc, recorded))
+    client = CLIClient("codex", spawn=make_spawner(proc, recorded))
     await client.status()
-    assert recorded == [["status", "--json"]]
+    assert recorded == [["codex", "status"]]
 
     proc2 = FakeProcess(stdout_lines=[json.dumps({"accounts": []}).encode()])
     recorded2: list[list[str]] = []
-    client2 = CLIClient(spawn=make_spawner(proc2, recorded2))
+    client2 = CLIClient("codex", spawn=make_spawner(proc2, recorded2))
     await client2.quota()
-    assert recorded2 == [["quota", "--json"]]
+    assert recorded2 == [["codex", "quota"]]
 
 
 async def test_nonzero_exit_with_json_error_raises_cli_error():
-    proc = FakeProcess(stderr=json.dumps({"error": "unknown account ref: x"}).encode(), returncode=1)
-    client = CLIClient(spawn=make_spawner(proc))
+    proc = FakeProcess(stderr=json.dumps({"error": {"message": "unknown account ref: x"}}).encode(), returncode=1)
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         await client.accounts_list()
@@ -132,7 +132,7 @@ async def test_nonzero_exit_with_json_error_raises_cli_error():
 
 async def test_nonzero_exit_with_non_json_stderr_shows_bounded_text():
     proc = FakeProcess(stderr=b"Traceback: boom", returncode=1)
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         await client.status()
@@ -142,7 +142,7 @@ async def test_nonzero_exit_with_non_json_stderr_shows_bounded_text():
 
 async def test_malformed_stdout_raises_cli_error():
     proc = FakeProcess(stdout_lines=[b"not json"])
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError):
         await client.accounts_list()
@@ -152,7 +152,7 @@ async def test_missing_cli_executable_raises_clear_cli_error():
     async def spawn(args):
         raise FileNotFoundError("no such file")
 
-    client = CLIClient(spawn=spawn)
+    client = CLIClient("codex", spawn=spawn)
 
     with pytest.raises(CLIError) as excinfo:
         await client.status()
@@ -173,18 +173,18 @@ async def test_login_streams_authorization_then_completed_events():
     ]
     recorded: list[list[str]] = []
     proc = FakeProcess(stdout_lines=lines, returncode=0)
-    client = CLIClient(spawn=make_spawner(proc, recorded))
+    client = CLIClient("codex", spawn=make_spawner(proc, recorded))
 
     events = [event async for event in client.login("a")]
 
     assert [event["event"] for event in events] == ["authorization_required", "completed"]
     assert events[0]["verification_uri"] == "https://example.com/device"
-    assert recorded == [["accounts", "login", "a", "--device", "--json"]]
+    assert recorded == [["codex", "account", "login", "a", "--device", "--events-jsonl"]]
 
 
 async def test_login_nonzero_exit_raises_cli_error_with_stderr_message():
     proc = FakeProcess(stderr=json.dumps({"error": "device flow expired"}).encode(), returncode=1)
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         async for _ in client.login("a"):
@@ -195,7 +195,7 @@ async def test_login_nonzero_exit_raises_cli_error_with_stderr_message():
 
 async def test_login_malformed_jsonl_line_raises_cli_error():
     proc = FakeProcess(stdout_lines=[b"not json\n"])
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError):
         async for _ in client.login("a"):
@@ -211,7 +211,7 @@ async def test_login_cancel_terminates_still_running_process():
         "interval": 5,
     }).encode() + b"\n"
     proc = FakeProcess(stdout_lines=[line])
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
     stream = client.login("a")
 
     first = await stream.__anext__()
@@ -227,7 +227,7 @@ async def test_login_cancel_terminates_still_running_process():
 
 async def test_login_cancel_on_already_exited_process_is_a_noop():
     proc = FakeProcess(stdout_lines=[json.dumps({"event": "completed", "account": {}}).encode() + b"\n"], returncode=0)
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
     stream = client.login("a")
 
     async for _ in stream:
@@ -243,7 +243,7 @@ async def test_login_completed_event_then_nonzero_exit_raises_cli_error():
         stderr=json.dumps({"error": "provider revoked session after completion"}).encode(),
         returncode=1,
     )
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         async for _ in client.login("a"):
@@ -255,7 +255,7 @@ async def test_login_completed_event_then_nonzero_exit_raises_cli_error():
 
 async def test_login_malformed_jsonl_terminates_still_running_process():
     proc = FakeProcess(stdout_lines=[b"not json\n"])
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
     stream = client.login("a")
 
     with pytest.raises(CLIError):
@@ -274,7 +274,7 @@ async def test_login_cancel_while_spawn_pending_terminates_new_process_without_l
         await release.wait()
         return proc
 
-    client = CLIClient(spawn=spawn)
+    client = CLIClient("codex", spawn=spawn)
     stream = client.login("a")
     next_task = asyncio.ensure_future(stream.__anext__())
     await asyncio.sleep(0)
@@ -290,7 +290,7 @@ async def test_login_cancel_while_spawn_pending_terminates_new_process_without_l
 async def test_login_malformed_jsonl_does_not_leak_line_contents_in_error():
     secret_line = b'{"token": "sk-super-secret-value", not-json\n'
     proc = FakeProcess(stdout_lines=[secret_line])
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         async for _ in client.login("a"):
@@ -309,7 +309,7 @@ async def test_run_json_cancelled_terminates_owned_process():
         return b"{}", b""
 
     proc.communicate = hanging_communicate  # type: ignore[method-assign]
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     task = asyncio.ensure_future(client.status())
     await asyncio.sleep(0)
@@ -329,7 +329,7 @@ async def test_run_json_timeout_terminates_process_and_raises_cli_error():
         return b"{}", b""
 
     proc.communicate = hanging_communicate  # type: ignore[method-assign]
-    client = CLIClient(spawn=make_spawner(proc), timeout=0.01)
+    client = CLIClient("codex", spawn=make_spawner(proc), timeout=0.01)
 
     with pytest.raises(CLIError) as excinfo:
         await client.status()
@@ -341,7 +341,7 @@ async def test_run_json_timeout_terminates_process_and_raises_cli_error():
 async def test_malformed_stdout_does_not_leak_payload_contents_in_error():
     secret_stdout = b'{"password": "hunter2-should-not-leak" not-json'
     proc = FakeProcess(stdout_lines=[secret_stdout])
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         await client.accounts_list()
@@ -351,7 +351,7 @@ async def test_malformed_stdout_does_not_leak_payload_contents_in_error():
 
 async def test_nonzero_exit_stderr_fallback_is_clipped_when_very_long():
     proc = FakeProcess(stderr=b"x" * 5000, returncode=1)
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
 
     with pytest.raises(CLIError) as excinfo:
         await client.status()
@@ -364,7 +364,7 @@ async def test_structured_malformed_stderr_does_not_forward_nested_secret():
         stderr=json.dumps({"error": {"message": "sk-embedded-secret-value"}}).encode(),
         returncode=1,
     )
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
     with pytest.raises(CLIError) as excinfo:
         await client.status()
     assert "sk-embedded-secret-value" not in excinfo.value.message
@@ -386,7 +386,7 @@ async def test_login_event_projection_does_not_forward_secret_fields():
         }).encode() + b"\n"
     ]
     proc = FakeProcess(stdout_lines=lines)
-    client = CLIClient(spawn=make_spawner(proc))
+    client = CLIClient("codex", spawn=make_spawner(proc))
     events = [event async for event in client.login("a")]
     dumped = json.dumps(events)
     assert "sk-never-forward" not in dumped
