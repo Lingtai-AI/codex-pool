@@ -123,9 +123,14 @@ async def _request_json_async(
                     remaining()
                     chunks.append(chunk)
                 remaining()
+                decoded_headers = [
+                    (name, value)
+                    for name, value in live.headers.multi_items()
+                    if name.lower() not in {"content-encoding", "content-length", "transfer-encoding"}
+                ]
                 return httpx.Response(
                     live.status_code,
-                    headers=live.headers,
+                    headers=decoded_headers,
                     content=b"".join(chunks),
                     request=live.request,
                 )

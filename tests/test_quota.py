@@ -300,7 +300,6 @@ def test_quota_accepts_camel_case_fields_and_legacy_window_shape(tmp_path):
 @pytest.mark.parametrize(
     "secondary",
     [
-        None,
         [],
         "bad",
         0,
@@ -321,6 +320,30 @@ def test_explicit_malformed_secondary_is_unavailable(tmp_path, secondary):
 
     assert result.status == "unavailable"
     assert result.error == "quota_fields_malformed"
+
+
+def test_explicit_null_secondary_is_absent(tmp_path):
+    auth = tmp_path / "auth.json"
+    write_auth_fixture(auth)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={
+        "rate_limit": {
+            "allowed": True,
+            "limit_reached": False,
+            "primary_window": {"used_percent": 28, "limit_window_seconds": 604800},
+            "secondary_window": None,
+        }
+    }))
+
+    result = read_quota(auth, transport=transport)
+
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.primary_remaining_percent == 72.0
+    assert result.primary_window_duration_mins == 10_080.0
+    assert result.secondary_used_percent is None
+    assert result.secondary_remaining_percent is None
+    assert result.allowed is True
+    assert result.limit_reached is False
 
 
 @pytest.mark.parametrize(
