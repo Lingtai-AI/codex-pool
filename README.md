@@ -1,6 +1,6 @@
 # subs-pool
 
-`subs-pool` 0.1.0 is a small Codex subscription pool with two distinct
+`subs-pool` 0.1.1 is a small Codex subscription pool with two distinct
 interfaces. `subspool` is the human TUI/foreground command surface;
 `subspool-cli` is a JSON-only Agent surface. Codex is the only built-in
 module. The package does not provide provider discovery, a service manager, a

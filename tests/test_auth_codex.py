@@ -1,4 +1,5 @@
 import base64
+import gzip
 import json
 
 import httpx
@@ -9,6 +10,7 @@ from subs_pool.modules.codex.auth_codex import (
     CodexTokenManager,
     is_token_expired_error,
     is_usage_limit_reached_error,
+    request_json,
 )
 from fakes import write_auth_fixture
 
@@ -123,3 +125,29 @@ def test_usage_limit_classifier_requires_exact_structural_match():
     assert is_usage_limit_reached_error(_Exc(status_code=429, code="usage_limit_reached")) is True
     assert is_usage_limit_reached_error(_Exc(status_code=429, code="rate_limited")) is False
     assert is_usage_limit_reached_error(_Exc(status_code=500, code="usage_limit_reached")) is False
+
+
+def test_request_json_decodes_gzip_response_once():
+    payload = {"rate_limit": {"allowed": True}}
+    compressed = gzip.compress(json.dumps(payload).encode("utf-8"))
+
+    class CompressedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield compressed
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+            stream=CompressedStream(),
+            request=request,
+        )
+
+    response = request_json(
+        "GET",
+        "https://example.test/usage",
+        transport=httpx.MockTransport(handler),
+        timeout_seconds=2.0,
+    )
+
+    assert response.json() == payload

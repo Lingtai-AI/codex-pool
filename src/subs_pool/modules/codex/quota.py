@@ -414,6 +414,11 @@ def _window(limit: Mapping[str, Any], kind: str, *, strict: bool = False) -> _Wi
     ]
     if not containers:
         return _Window(None, None, None, None)
+    # Live WHAM uses an explicit null for an unsupported secondary window.
+    # Treat only that single-container shape as absent; conflicting aliases and
+    # every other malformed explicit value still fail closed below.
+    if strict and len(containers) == 1 and containers[0] is None:
+        return _Window(None, None, None, None)
     if not strict or len(containers) == 1:
         return _window_mapping(containers[0], strict=strict)
 
